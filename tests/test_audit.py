@@ -108,6 +108,32 @@ class ContractTest(unittest.TestCase):
         report = json.loads(done.stdout)
         self.assertEqual(set(report["counts"].values()), {0})
         self.assertEqual(report["findings"], [])
+        closure = report["closure"]
+        self.assertEqual(
+            closure["odb_blobs"],
+            closure["head_blobs"] + closure["covered_blobs"] + closure["uncovered_blobs"],
+        )
+        self.assertEqual(closure["uncovered_blobs"], 0)
+
+    def test_a_blob_no_ref_reaches_is_declared_as_a_gap_and_then_named(self) -> None:
+        repo = make_repo(self.box)
+        orphan = git(
+            repo, "hash-object", "-w", "--stdin", env=_clean_env(), input="TOKEN=%s\n" % "live"
+        ).strip()
+        silent = audit(str(repo), "--json")
+        self.assertEqual(silent.returncode, 0, silent.stderr)
+        report = json.loads(silent.stdout)
+        self.assertEqual(report["closure"]["uncovered_blobs"], 1)
+        self.assertEqual(report["closure"]["uncovered_sample"], [orphan[:12]])
+        self.assertEqual(report["findings"], [])
+        printed = audit(str(repo))
+        self.assertIn("reachable from no ref", printed.stdout)
+
+        named = audit(str(repo), "--json", "--unreachable")
+        self.assertEqual(named.returncode, 0, named.stderr)
+        report = json.loads(named.stdout)
+        self.assertEqual(report["closure"]["uncovered_blobs"], 0)
+        self.assertEqual([f["oid"] for f in report["findings"]], [orphan])
 
     def test_hidden_env_file_exits_one(self) -> None:
         repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n"})

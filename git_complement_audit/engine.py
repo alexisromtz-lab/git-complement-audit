@@ -254,6 +254,18 @@ def _tree_blobs(listing: str) -> dict[str, str]:
     return paths
 
 
+def _all_blob_ids(repo) -> set[str]:
+    """Every blob physically in the object database, reachable from a ref or not.
+
+    `rev-list --all` answers what a ref reaches; this answers what the repository holds.
+    The two differ exactly for the objects `git gc --prune` deletes without ever having
+    named them, which is the population an audit must not be silent about.
+    """
+    out = git(repo, "cat-file", "--batch-all-objects", "--batch-check")
+    rows = (line.split() for line in out.splitlines())
+    return {row[0] for row in rows if len(row) == 3 and row[1] == "blob"}
+
+
 def _ref_rows(repo) -> list[tuple[str, str, str]]:
     """Every ref as (name, object type, object id): one census, reused by every counter."""
     out = git_maybe(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)") or ""
@@ -497,6 +509,20 @@ def audit(
     for finding in findings:
         finding["size"] = sizes.get(finding["oid"], ("", 0))[1]
 
+    # Closure: HEAD plus the complement must be the database, or the report is narrower than
+    # the repository it claims to measure. The gap can only be objects no ref reaches, which
+    # --unreachable names; it is published either way, and it never invents a fourth exit code.
+    database = _all_blob_ids(root)
+    covered = set(outside_head) | {f["oid"] for f in findings if f["root"] == "unreachable"}
+    uncovered = sorted(database - head_oids - covered)
+    closure = {
+        "odb_blobs": len(database),
+        "head_blobs": len(head_oids & database),
+        "covered_blobs": len(covered & database),
+        "uncovered_blobs": len(uncovered),
+        "uncovered_sample": [oid[:12] for oid in uncovered[:8]],
+    }
+
     # An exemption is granted to a claim of danger, by content address, and only after the
     # claim has been made: the class it replaces stays recorded so the act is auditable.
     applied: list[str] = []
@@ -563,6 +589,7 @@ def audit(
         },
         "counts": counts,
         "exemptions": exemptions,
+        "closure": closure,
         "findings": findings,
     }
 
@@ -649,6 +676,7 @@ def receipt(repo, report: dict, path) -> str:
         "universe": report["universe"],
         "counts": report["counts"],
         "exemptions": report["exemptions"],
+        "closure": report["closure"],
         "findings": findings,
     }
     payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
@@ -661,6 +689,7 @@ def receipt(repo, report: dict, path) -> str:
 
 def render(report: dict) -> str:
     repo, universe, counts = report["repo"], report["universe"], report["counts"]
+    closure = report["closure"]
     scope = report["scope"]
     included = [key for key, value in scope.items() if value is True]
     lines = [
@@ -716,8 +745,27 @@ def render(report: dict) -> str:
             universe["blobs_not_named"],
             scope["history scan"],
         ),
+        "CLOSURE   odb-blobs=%d = head=%d + complement=%d + uncovered=%d"
+        % (
+            closure["odb_blobs"],
+            closure["head_blobs"],
+            closure["covered_blobs"],
+            closure["uncovered_blobs"],
+        ),
         "CLASSES   %s" % " · ".join("%s=%d" % (kind, counts[kind]) for kind in CLASSES),
     ]
+    if closure["uncovered_blobs"] and not scope["unreachable objects"]:
+        lines.append(
+            "NOTE      %d blob(s) in the object database are reachable from no ref, so no row of "
+            "this report holds them; --unreachable names them before 'git gc --prune' deletes "
+            "them for good" % closure["uncovered_blobs"]
+        )
+    elif closure["uncovered_blobs"]:
+        lines.append(
+            "NOTE      %d blob(s) survived the unreachable pass (%s), so the report is narrower "
+            "than the database"
+            % (closure["uncovered_blobs"], ", ".join(closure["uncovered_sample"]))
+        )
     if not scope["every path of each ref tip"]:
         lines.append(
             "NOTE      per-tip listing skipped: %d ref tips > limit %d, so MOVED can be "

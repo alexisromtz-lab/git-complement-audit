@@ -44,7 +44,7 @@ network client, no plugin system.
 ## Verification, before any commit
 
 ```bash
-python -m git_complement_audit --self-test          # 67 in-process checks, RC 0
+python -m git_complement_audit --self-test          # 72 in-process checks, RC 0
 python -m unittest discover -s tests                # CLI contract, RC 0
 ```
 
@@ -70,6 +70,16 @@ row the report holds back because its ref was excluded. It is *unnamed* when no 
 bytes are counted always, read only under `--scan-history`, and the skip is printed. Never
 derive one addend from the other, and never let a flag move a blob from one to the other
 without saying so on a line of the report.
+
+## Closing the database
+
+`odb_blobs = head_blobs + covered_blobs + uncovered_blobs`, and the report carries all four.
+The left side is asked of the object database (`git cat-file --batch-all-objects`), never
+inferred from the refs it walked, because a population derived from the walk can only ever
+confirm the walk. `uncovered > 0` means objects no ref reaches: the render states the number
+and names `--unreachable`, which returns them as rows and closes the identity. A gap is never a
+fourth exit code — the verdict comes from the classes — but a run that omits the identity is
+not allowed to print a verdict at all: no reader, no claim.
 
 ## Style
 

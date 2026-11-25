@@ -38,6 +38,7 @@ INCLUDED  all refs except HEAD; worktree HEADs; every path of each ref tip
 HIDDEN    runtime namespaces: refs/agents/1
 UNIVERSE  paths-outside-head=8 blobs=8 bytes=167
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=off
+CLOSURE   odb-blobs=11 = head=3 + complement=8 + uncovered=0
 CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
 NOTE      1 blob(s) outside HEAD are named by no path row — their path is still in HEAD, or another blob took it — so their contents were not read; a credential there survives in every clone; --scan-history reads them
   MOVED                     15 B  app_copy.py
@@ -55,6 +56,7 @@ Add `--scan-history` and the one blob no path row could name is read too:
 
 ```
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=on
+CLOSURE   odb-blobs=11 = head=3 + complement=8 + uncovered=0
 CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=1 · EXEMPT_SECRET=0
   HISTORY_SECRET_RISK        28 B  README.md  [history]
 VERDICT   RC 1 — 6 finding(s) outside HEAD need a rescue, a commit or a rotation (ORPHAN_CODE=3, ORPHAN_SECRET_RISK=2, HISTORY_SECRET_RISK=1)
@@ -65,6 +67,7 @@ the other way — nothing is lost, and the claim is still on the page:
 
 ```
 EXEMPT    .git-complement-audit-ignore declared=2 applied=2 unused=0
+CLOSURE   odb-blobs=11 = head=3 + complement=8 + uncovered=0
 CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=1 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=2
   EXEMPT_SECRET             22 B  .env  [ORPHAN_SECRET_RISK → declared at .git-complement-audit-ignore:2]
   EXEMPT_SECRET             28 B  README.md  [HISTORY_SECRET_RISK → declared at .git-complement-audit-ignore:1]
@@ -144,6 +147,32 @@ It is not the default because it reads content the audit otherwise only classifi
 and on a large object database that is the expensive pass. It is not silent either: `scan=off`
 with `unnamed>0` always prints what was left unread.
 
+## The database closes
+
+Every number above is a reading taken from refs. A report built that way is only as complete
+as its population, so the last line of the measurement is an identity instead of a count:
+
+```
+odb_blobs = head_blobs + covered_blobs + uncovered_blobs
+```
+
+`odb_blobs` comes from `git cat-file --batch-all-objects --batch-check`, which asks the object
+database what it holds rather than asking a ref what it reaches. `head_blobs` is what `HEAD`
+reaches. `covered_blobs` is what this report has a row or a blob for. The remainder is the
+population no ref reaches — the objects `git gc --prune` deletes without ever having named
+them, which no `rev-list --all` can show you:
+
+```bash
+git hash-object -w --stdin <<< 'AWS_SECRET_ACCESS_KEY=...'   # no ref, no path, no warning
+git gc --prune=now                                          # gone
+```
+
+When `uncovered` is not zero the render prints `NOTE` and names the flag that reads them;
+`--unreachable` walks `git fsck --unreachable` and returns them as rows, so the second run
+closes to zero. A gap is never an exit code of its own — the verdict still comes from the six
+classes — but a report that does not say how much of the database it left out would be the
+false green this tool exists to prevent.
+
 ## Exemptions, by content address
 
 An audit that cannot be run on its own repository is an opinion, not an instrument. The
@@ -212,7 +241,8 @@ labels each such finding `[excluded refs]`:
 EXCLUDED  patterns=refs/agents/* refs=1 tips=1 secret-scan=on
 HIDDEN    runtime namespaces: refs/agents/1
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=off
-CLASSES   MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0
+CLOSURE   odb-blobs=11 = head=3 + complement=8 + uncovered=0
+CLASSES   MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
   MOVED                     15 B  app_copy.py
   ORPHAN_CODE               27 B  orphan/handler.py
   ORPHAN_CODE               28 B  scratch/agent_notes.py
@@ -312,7 +342,7 @@ As a `pre-commit` hook, add to `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/alexisromtz-lab/git-complement-audit
-  rev: v1.3.1
+  rev: v1.4.0
   hooks:
     - id: git-complement-audit
 ```
@@ -329,8 +359,9 @@ one dangling secret — audits it every way the flags allow, declares an exempti
 it, rescues it, and checks the result:
 
 ```
-SELF-TEST passed: 67 checks on a synthetic repository
+SELF-TEST passed: 72 checks on a synthetic repository
 fixture classes: MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
+fixture closure: odb-blobs=12 = head=3 + complement=9 + uncovered=0
 fixture verdict: RC 1 · rescue 6 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2
 ```
 
@@ -345,6 +376,11 @@ and that a declared exemption moves a secret out of the gate while leaving orpha
 ## Limits, stated
 
 - It audits one repository at a time; the object database is the unit, not the filesystem.
+- The closure reads the whole object database once, with `git cat-file --batch-all-objects`.
+  On a small repository that is milliseconds; on a database of millions of objects it is the
+  one line that dominates the run, and it is worth it, because without it the report cannot
+  say how much of the database it did not look at. If the identity does not close, the gap is
+  printed, and `--unreachable` is what closes it.
 - `--unreachable` finds objects no ref reaches, but a blob that was never written cannot be found.
 - Secret detection is path-based, plus a token *shape* — a known prefix followed by a body of
   a known length — over the first 64 KiB. It flags risk; it does not prove a credential is live,

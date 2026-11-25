@@ -172,11 +172,27 @@ def run() -> int:
         plain = engine.audit(repo, include_unreachable=False)
         check("unreachable objects are out of the default scope",
               not any(f["path"].startswith("@unreachable/") for f in plain["findings"]))
+        check("closure: HEAD plus the complement is the object database",
+              plain["closure"]["odb_blobs"]
+              == plain["closure"]["head_blobs"] + plain["closure"]["covered_blobs"]
+              + plain["closure"]["uncovered_blobs"])
+        check("closure: a repository with nothing dangling closes to zero",
+              plain["closure"]["uncovered_blobs"] == 0)
         engine.git(repo, "hash-object", "-w", "--stdin", input=DANGLING_SECRET)
+        strict = engine.audit(repo)
         wide = engine.audit(repo, include_unreachable=True)
         check("--unreachable surfaces a dangling secret blob", any(
             f["class"] == engine.ORPHAN_SECRET_RISK and f["path"].startswith("@unreachable/")
             for f in wide["findings"]))
+        named_by_pass = sum(1 for f in wide["findings"] if f["root"] == "unreachable")
+        check("closure: the gap declared by a default run is exactly what --unreachable names",
+              strict["closure"]["uncovered_blobs"] == named_by_pass > 0)
+        check("closure: --unreachable closes the gap it names",
+              wide["closure"]["uncovered_blobs"] == 0
+              and wide["closure"]["odb_blobs"] == strict["closure"]["odb_blobs"])
+        check("closure: the default render declares the gap instead of omitting it",
+              "reachable from no ref" in engine.render(strict)
+              and "uncovered=%d" % named_by_pass in engine.render(strict))
 
         counts_by_object = report["universe"]
         check("blobs outside HEAD count per object, not per path",
@@ -330,6 +346,15 @@ def run() -> int:
 
     print("SELF-TEST passed: %d checks on a synthetic repository" % len(checks))
     print("fixture classes: %s" % " · ".join("%s=%d" % (kind, EXPECTED[kind]) for kind in engine.CLASSES))
+    print(
+        "fixture closure: odb-blobs=%d = head=%d + complement=%d + uncovered=%d"
+        % (
+            wide["closure"]["odb_blobs"],
+            wide["closure"]["head_blobs"],
+            wide["closure"]["covered_blobs"],
+            wide["closure"]["uncovered_blobs"],
+        )
+    )
     print(
         "fixture verdict: RC 1 · rescue %d files re-hashed · receipt byte-identical · "
         "clean RC 0 · invalid RC 2" % len(rows)
