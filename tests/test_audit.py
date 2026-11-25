@@ -118,6 +118,37 @@ class ContractTest(unittest.TestCase):
         secrets = [f["path"] for f in report["findings"] if f["class"] == "ORPHAN_SECRET_RISK"]
         self.assertEqual(secrets, ["deep/.env"])
 
+    def test_credential_at_a_path_that_still_exists_in_head_is_declared_and_read(self) -> None:
+        repo = make_repo(self.box, {"app.py": "KEY = 'AKIAIOSFODNN7EXAMPLE'\n"})
+        silent = audit(str(repo), "--json")
+        self.assertEqual(silent.returncode, 0, silent.stderr)
+        report = json.loads(silent.stdout)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["counts"]["ORPHAN_SECRET_RISK"], 0)
+        self.assertEqual(report["scope"]["history scan"], "off")
+        self.assertEqual(report["universe"]["blobs_not_named"], 1)
+        printed = audit(str(repo))
+        self.assertEqual(printed.returncode, 0, printed.stderr)
+        self.assertIn("are named by no path row", printed.stdout)
+
+        found = audit(str(repo), "--json", "--scan-history")
+        self.assertEqual(found.returncode, 1, found.stderr)
+        report = json.loads(found.stdout)
+        self.assertEqual(
+            [(f["class"], f["path"]) for f in report["findings"]],
+            [("HISTORY_SECRET_RISK", "app.py")],
+        )
+        self.assertEqual(report["universe"]["blobs_not_named"], 1)
+
+    def test_clean_repository_declares_nothing_unread(self) -> None:
+        repo = make_repo(self.box)
+        report = json.loads(audit(str(repo), "--json").stdout)
+        self.assertEqual(report["universe"]["blobs_outside_head"], 0)
+        self.assertEqual(report["universe"]["blobs_not_named"], 0)
+        self.assertEqual(report["scope"]["history scan"], "off")
+        done = audit(str(repo), "--scan-history")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_exclude_ref_drops_noise_but_never_a_secret(self) -> None:
         repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n", "deep/lost.py": "x = 1\n"})
         done = audit(str(repo), "--json", "--exclude-ref", "refs/custom/*")

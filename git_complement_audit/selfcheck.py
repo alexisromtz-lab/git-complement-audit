@@ -28,6 +28,9 @@ SIDE_FILES = {
     ".env": "API_TOKEN=placeholder\n",  # -> ORPHAN_SECRET_RISK
     "docs/design.md": "# design\n",  # -> ORPHAN_DOC
     "build/out.bin": "\x00\x01\x02 binary\n",  # -> RESIDUE
+    # Its path still exists in HEAD, so no path row can name it: the blob is only read
+    # under --scan-history, and there it -> HISTORY_SECRET_RISK.
+    "README.md": "setup: AKIAIOSFODNN7EXAMPLE\n",
 }
 WORKTREE_FILE = "scratch/agent_notes.py"
 DANGLING_SECRET = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n"
@@ -41,7 +44,9 @@ EXPECTED = {
     engine.ORPHAN_SECRET_RISK: 2,
     engine.ORPHAN_DOC: 1,
     engine.RESIDUE: 1,
+    engine.HISTORY_SECRET_RISK: 0,
 }
+UNNAMED = 1
 
 
 def _commit(repo: pathlib.Path, files: dict[str, str], message: str, parent: str | None = None,
@@ -135,6 +140,11 @@ def run() -> int:
             for f in excluded["findings"]))
         check("--exclude-ref never returns RC 0 over a secret it excluded",
               cli.main([str(repo), "--quiet", "--exclude-ref", "refs/custom/*"]) == cli.RC_FINDINGS)
+        check("--exclude-ref never inflates the blobs it did not read",
+              excluded["universe"]["blobs_not_named"] == UNNAMED)
+        check("--exclude-ref keeps the population per object whole",
+              excluded["universe"]["blobs_outside_head"]
+              == excluded["universe"]["blobs_named"] + excluded["universe"]["blobs_not_named"])
 
         runtime = engine.audit(repo, exclude_refs=("refs/agents/*",))
         check("--exclude-ref drops runtime code noise",
@@ -143,6 +153,8 @@ def run() -> int:
               runtime["counts"][engine.ORPHAN_SECRET_RISK] == EXPECTED[engine.ORPHAN_SECRET_RISK])
         check("hidden runtime namespaces are counted even when excluded",
               runtime["hidden_refs"]["refs/agents/"] == 1)
+        check("a runtime namespace excluded for noise leaves no false unread blob",
+              runtime["universe"]["blobs_not_named"] == UNNAMED)
 
         opted_out = engine.audit(repo, exclude_refs=("refs/custom/*",), allow_excluded_secrets=True)
         check("--allow-excluded-secrets drops the excluded secret",
@@ -162,6 +174,31 @@ def run() -> int:
         check("--unreachable surfaces a dangling secret blob", any(
             f["class"] == engine.ORPHAN_SECRET_RISK and f["path"].startswith("@unreachable/")
             for f in wide["findings"]))
+
+        counts_by_object = report["universe"]
+        check("blobs outside HEAD count per object, not per path",
+              counts_by_object["blobs_outside_head"]
+              == counts_by_object["blobs_named"] + counts_by_object["blobs_not_named"])
+        check("a credential whose path survives in HEAD is declared, not dropped",
+              counts_by_object["blobs_not_named"] == UNNAMED)
+        check("the default run declares the history scan is off",
+              report["scope"]["history scan"] == "off")
+        check("the render declares the blob it did not read, findings or not",
+              "%d blob(s) outside HEAD are named by no path row" % UNNAMED
+              in engine.render(report))
+
+        history = engine.audit(repo, scan_history=True)
+        check("--scan-history names a credential whose path survives in HEAD", any(
+            f["class"] == engine.HISTORY_SECRET_RISK and f["path"] == "README.md"
+            for f in history["findings"]))
+        check("--scan-history names the credential's origin",
+              all(f["root"] == "history" for f in history["findings"]
+                  if f["class"] == engine.HISTORY_SECRET_RISK))
+        check("--scan-history does not shrink the population it declares",
+              history["universe"]["blobs_not_named"] == UNNAMED)
+        check("--scan-history fails the gate", engine.has_failure(history))
+        check("--scan-history returns RC 1 from the cli",
+              cli.main([str(repo), "--quiet", "--scan-history"]) == cli.RC_FINDINGS)
 
         rescue_dir = base / "rescue"
         rows = engine.rescue(repo, report, rescue_dir)
@@ -189,6 +226,7 @@ def run() -> int:
         _init(clean)
         clean_report = engine.audit(clean)
         check("clean repository reports nothing", sum(clean_report["counts"].values()) == 0)
+        check("clean repository leaves nothing unnamed", clean_report["universe"]["blobs_not_named"] == 0)
         check("clean repository returns RC 0", cli.main([str(clean), "--quiet"]) == cli.RC_CLEAN)
 
         docs = _init(base / "docs-only")

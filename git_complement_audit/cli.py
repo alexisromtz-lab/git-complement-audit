@@ -24,8 +24,8 @@ def _parser() -> argparse.ArgumentParser:
             "destroys it."
         ),
         epilog=(
-            "exit codes: 0 no orphaned code or secrets · 1 orphaned code or secret risk found "
-            "· 2 invalid repository or arguments"
+            "exit codes: 0 no orphaned code, secrets or history credentials · 1 orphaned code, "
+            "secret risk or history credential found · 2 invalid repository or arguments"
         ),
     )
     parser.add_argument("repo", nargs="?", default=".", help="repository to audit (default: .)")
@@ -36,6 +36,15 @@ def _parser() -> argparse.ArgumentParser:
         "--unreachable",
         action="store_true",
         help="also scan objects no ref reaches (slower; finds dropped stashes and dangling blobs)",
+    )
+    parser.add_argument(
+        "--scan-history",
+        dest="scan_history",
+        action="store_true",
+        help=(
+            "read the blobs outside HEAD that no path row names — their path still exists in "
+            "HEAD, or another blob took it — and report the ones that look secret"
+        ),
     )
     parser.add_argument(
         "--no-worktrees",
@@ -85,6 +94,7 @@ def main(argv=None) -> int:
             max_tip_listings=args.ref_tips,
             exclude_refs=tuple(args.exclude_refs),
             allow_excluded_secrets=args.allow_excluded_secrets,
+            scan_history=args.scan_history,
         )
         if args.rescue_dir:
             rows = engine.rescue(args.repo, report, args.rescue_dir)

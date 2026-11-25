@@ -22,10 +22,11 @@ ORPHAN_CODE = "ORPHAN_CODE"
 ORPHAN_SECRET_RISK = "ORPHAN_SECRET_RISK"
 ORPHAN_DOC = "ORPHAN_DOC"
 RESIDUE = "RESIDUE"
+HISTORY_SECRET_RISK = "HISTORY_SECRET_RISK"
 
-CLASSES = (MOVED, ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC, RESIDUE)
+CLASSES = (MOVED, ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC, RESIDUE, HISTORY_SECRET_RISK)
 RESCUABLE = (ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC)
-FAILING = (ORPHAN_CODE, ORPHAN_SECRET_RISK)
+FAILING = (ORPHAN_CODE, ORPHAN_SECRET_RISK, HISTORY_SECRET_RISK)
 
 CODE_EXTENSIONS = frozenset(
     {
@@ -151,15 +152,47 @@ def _object_types(repo, oids) -> dict[str, tuple[str, int]]:
     return types
 
 
-def _blobs(repo, listing: str) -> dict[str, str]:
-    """`<oid> <path>` lines reduced to the blobs: commits and trees carry no usable path."""
-    candidates = {}
+def _blob_index(repo, listing: str) -> tuple[dict[str, str], dict[str, str]]:
+    """`<oid> <path>` lines reduced to blobs, by path and by object.
+
+    The path view is what a row can name, and it holds one blob per path. The object view
+    is the denominator: two versions of one path are two blobs, and the one the path view
+    dropped is still in the object database.
+    """
+    candidates: dict[str, str] = {}
+    first_path: dict[str, str] = {}
     for line in listing.splitlines():
         oid, _, path = line.partition(" ")
+        if oid:
+            first_path.setdefault(oid, path)
         if path and not path.startswith("@"):
             candidates[path] = oid
-    types = _object_types(repo, sorted(set(candidates.values())))
-    return {path: oid for path, oid in candidates.items() if types.get(oid, ("", 0))[0] == "blob"}
+    types = _object_types(repo, sorted(set(candidates.values()) | set(first_path)))
+    by_path = {path: oid for path, oid in candidates.items() if types.get(oid, ("", 0))[0] == "blob"}
+    by_oid = {oid: path for oid, path in first_path.items() if types.get(oid, ("", 0))[0] == "blob"}
+    return by_path, by_oid
+
+
+def _contents(repo, oids) -> dict[str, bytes]:
+    """Blob prefixes for many objects in one process; `--batch` is size-prefixed, so binary is safe."""
+    if not oids:
+        return {}
+    payload = "".join(oid + "\n" for oid in oids).encode("utf-8")
+    out = git(repo, "cat-file", "--batch", input=payload, text=False)
+    contents: dict[str, bytes] = {}
+    cursor = 0
+    while cursor < len(out):
+        newline = out.find(b"\n", cursor)
+        if newline < 0:
+            break
+        header = out[cursor:newline].split()
+        cursor = newline + 1
+        if len(header) != 3:
+            continue
+        size = int(header[2])
+        contents[header[0].decode("ascii")] = out[cursor:cursor + size][:SNIFF_BYTES]
+        cursor += size + 1
+    return contents
 
 
 def _tree_blobs(listing: str) -> dict[str, str]:
@@ -252,6 +285,7 @@ def audit(
     max_tip_listings: int = MAX_TIP_LISTINGS,
     exclude_refs=(),
     allow_excluded_secrets: bool = False,
+    scan_history: bool = False,
 ) -> dict:
     """Measure the complement. Writes nothing; every number here is a reading.
 
@@ -283,7 +317,7 @@ def audit(
     skipped = list(excluded) + ([] if include_worktrees else extras)
     if skipped:
         walk += ["--not", *sorted(set(skipped))]
-    complement = _blobs(root, git(root, *walk))
+    complement, seen = _blob_index(root, git(root, *walk))
 
     tips += extras if include_worktrees else []
     exact_tips = sorted(set(tips))
@@ -294,6 +328,7 @@ def audit(
             if listing:
                 for path, oid in _tree_blobs(listing).items():
                     complement.setdefault(path, oid)
+                    seen.setdefault(oid, path)
 
     findings = []
     for path in sorted(complement):
@@ -315,13 +350,24 @@ def audit(
     excluded_scan = "not requested"
     if exclude_refs:
         excluded_scan = "off (--allow-excluded-secrets)" if allow_excluded_secrets else "on"
+    origin: dict[str, str] = {}
+    # Blobs whose path the report holds back because it sits outside HEAD in an excluded
+    # ref: they are named, so they are not the unread population the history scan is for.
+    named_but_unpublished: set[str] = set()
     if excluded and excluded_scan == "on":
         # `--not` would drop every blob shared with the included roots, and a secret shared
         # with one would disappear; walking the excluded tips alone keeps them visible.
         listing = git(root, "rev-list", "--objects", "--stdin", input="\n".join(excluded) + "\n")
+        excluded_by_path, excluded_blobs = _blob_index(root, listing)
+        for oid, path in excluded_blobs.items():
+            seen.setdefault(oid, path)
+            origin.setdefault(oid, "excluded refs")
         taken = {(f["class"], f["path"], f["oid"]) for f in findings}
-        for path, oid in _blobs(root, listing).items():
-            if path in head_paths or oid in head_oids or not is_secret_path(path):
+        for path, oid in excluded_by_path.items():
+            if path in head_paths:
+                continue
+            named_but_unpublished.add(oid)
+            if oid in head_oids or not is_secret_path(path):
                 continue
             if (ORPHAN_SECRET_RISK, path, oid) in taken:
                 continue
@@ -348,6 +394,23 @@ def audit(
                     "root": "unreachable",
                 }
             )
+
+    named = {finding["oid"] for finding in findings} | named_but_unpublished
+    outside_head = {oid for oid in seen if oid not in head_oids}
+    unnamed = sorted(outside_head - named)
+    if scan_history and unnamed:
+        # A credential whose path still exists in HEAD is not an orphan path, but it is in
+        # every clone. The content is read only here, and only for the blobs no row names.
+        for oid, content in _contents(root, unnamed).items():
+            if looks_secret(content):
+                findings.append(
+                    {
+                        "class": HISTORY_SECRET_RISK,
+                        "path": seen.get(oid) or "@history/" + oid,
+                        "oid": oid,
+                        "root": origin.get(oid, "history"),
+                    }
+                )
 
     sizes = _object_types(root, sorted({f["oid"] for f in findings}))
     for finding in findings:
@@ -382,6 +445,7 @@ def audit(
             "ref tips excluded": len(excluded),
             "exclude-ref patterns": list(exclude_refs),
             "excluded secret scan": excluded_scan,
+            "history scan": "on" if scan_history else "off",
         },
         "hidden_refs": hidden,
         "universe": {
@@ -389,6 +453,9 @@ def audit(
             "blobs": len({f["oid"] for f in findings}),
             "bytes": sum(f["size"] for f in findings),
             "unreachable_scanned": unreachable if include_unreachable else 0,
+            "blobs_outside_head": len(outside_head),
+            "blobs_named": len(outside_head) - len(unnamed),
+            "blobs_not_named": len(unnamed),
         },
         "counts": counts,
         "findings": findings,
@@ -517,6 +584,13 @@ def render(report: dict) -> str:
     lines += [
         "UNIVERSE  paths-outside-head=%d blobs=%d bytes=%d"
         % (universe["paths"], universe["blobs"], universe["bytes"]),
+        "HISTORY   blobs-outside-head=%d named=%d unnamed=%d scan=%s"
+        % (
+            universe["blobs_outside_head"],
+            universe["blobs_named"],
+            universe["blobs_not_named"],
+            scope["history scan"],
+        ),
         "CLASSES   %s" % " · ".join("%s=%d" % (kind, counts[kind]) for kind in CLASSES),
     ]
     if not scope["every path of each ref tip"]:
@@ -530,6 +604,12 @@ def render(report: dict) -> str:
             "NOTE      %d excluded ref tips were not scanned for secrets: --allow-excluded-secrets"
             % scope["ref tips excluded"]
         )
+    if universe["blobs_not_named"] and scope["history scan"] == "off":
+        lines.append(
+            "NOTE      %d blob(s) outside HEAD are named by no path row — their path is still in "
+            "HEAD, or another blob took it — so their contents were not read; a credential there "
+            "survives in every clone; --scan-history reads them" % universe["blobs_not_named"]
+        )
     for finding in report["findings"]:
         origin = "" if finding["root"] == "refs" else "  [%s]" % finding["root"]
         lines.append(
@@ -539,9 +619,15 @@ def render(report: dict) -> str:
     if failing:
         total = sum(counts[kind] for kind in failing)
         lines.append(
-            "VERDICT   RC 1 — %d finding(s) outside HEAD need a rescue or a commit (%s)"
+            "VERDICT   RC 1 — %d finding(s) outside HEAD need a rescue, a commit or a rotation (%s)"
             % (total, ", ".join("%s=%d" % (kind, counts[kind]) for kind in failing))
         )
     else:
-        lines.append("VERDICT   RC 0 — no orphaned code or secrets outside HEAD")
+        if universe["blobs_named"]:
+            lines.append(
+                "VERDICT   RC 0 — no orphaned code or secrets among the %d blob(s) named outside HEAD"
+                % universe["blobs_named"]
+            )
+        else:
+            lines.append("VERDICT   RC 0 — no path outside HEAD needs a rescue")
     return "\n".join(lines)

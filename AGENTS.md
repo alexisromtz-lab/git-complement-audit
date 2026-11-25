@@ -37,7 +37,7 @@ network client, no plugin system.
 ## Verification, before any commit
 
 ```bash
-python -m git_complement_audit --self-test          # 38 in-process checks, RC 0
+python -m git_complement_audit --self-test          # 51 in-process checks, RC 0
 python -m unittest discover -s tests                # CLI contract, RC 0
 ```
 
@@ -47,9 +47,21 @@ state why in the commit message.
 ## Changing the classifier
 
 Classes are mutually exclusive and total. `engine.CLASSES` fixes the order, and the first test
-that matches wins: `MOVED` → `ORPHAN_SECRET_RISK` → `ORPHAN_CODE` → `ORPHAN_DOC` → `RESIDUE`.
-A new class needs, in the same commit: the constant, the order, the `FAILING` decision, the
-README table, and a fixture file in `selfcheck.py` that lands in it.
+that matches wins: `MOVED` → `ORPHAN_SECRET_RISK` → `ORPHAN_CODE` → `ORPHAN_DOC` → `RESIDUE`,
+then `HISTORY_SECRET_RISK`, which is decided by content after the path loop and therefore
+cannot be reached by a path at all. A new class needs, in the same commit: the constant, the
+order, the `FAILING` decision, the README table, and a fixture file in `selfcheck.py` that
+lands in it.
+
+## Publishing the universe
+
+The blob complement is a partition, `blobs_outside_head = blobs_named + blobs_not_named`, and
+both addends travel in every report. A blob is *named* when a row points at it — including a
+row the report holds back because its ref was excluded. It is *unnamed* when no path outside
+`HEAD` reaches it, which is the shape of a credential deleted but still in the history: those
+bytes are counted always, read only under `--scan-history`, and the skip is printed. Never
+derive one addend from the other, and never let a flag move a blob from one to the other
+without saying so on a line of the report.
 
 ## Style
 
