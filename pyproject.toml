@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-complement-audit"
+description = "Audit every path Git keeps outside HEAD before 'git worktree prune' or 'git gc --prune' destroys it."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "alexisromtz-lab" }]
+keywords = ["git", "orphans", "worktree", "secrets", "forensics", "cli"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+dynamic = ["version"]
+
+[project.scripts]
+git-complement-audit = "git_complement_audit.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alexisromtz-lab/git-complement-audit"
+Issues = "https://github.com/alexisromtz-lab/git-complement-audit/issues"
+
+[tool.setuptools]
+packages = ["git_complement_audit"]
+
+[tool.setuptools.dynamic]
+version = { attr = "git_complement_audit.__version__" }

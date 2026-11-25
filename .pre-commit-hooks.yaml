@@ -1,0 +1,8 @@
+- id: git-complement-audit
+  name: git complement audit
+  description: Fail when code or secrets sit outside HEAD and would be lost on "git gc --prune".
+  entry: git-complement-audit
+  language: python
+  always_run: true
+  pass_filenames: false
+  require_serial: true

@@ -1,0 +1,469 @@
+"""Census of the object-database complement: every path reachable by Git but not by HEAD.
+
+The subject is deliberately narrow and declared: paths that some ref or worktree HEAD
+reaches and that ``HEAD`` does not contain. Paths that still exist in ``HEAD`` are never
+reported, even when their content differs, because a moved or edited file is not a
+missing file.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+
+from . import __version__
+
+MOVED = "MOVED"
+ORPHAN_CODE = "ORPHAN_CODE"
+ORPHAN_SECRET_RISK = "ORPHAN_SECRET_RISK"
+ORPHAN_DOC = "ORPHAN_DOC"
+RESIDUE = "RESIDUE"
+
+CLASSES = (MOVED, ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC, RESIDUE)
+RESCUABLE = (ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC)
+FAILING = (ORPHAN_CODE, ORPHAN_SECRET_RISK)
+
+CODE_EXTENSIONS = frozenset(
+    {
+        ".py", ".pyi", ".sh", ".bash", ".zsh", ".mjs", ".cjs", ".js", ".jsx",
+        ".ts", ".tsx", ".rb", ".go", ".rs", ".java", ".kt", ".c", ".h", ".cc",
+        ".cpp", ".hpp", ".cs", ".php", ".pl", ".lua", ".swift", ".scala",
+        ".sql", ".yml", ".yaml", ".toml", ".tf", ".dockerfile", ".mk",
+    }
+)
+DOC_EXTENSIONS = frozenset(
+    {".md", ".markdown", ".rst", ".adoc", ".asciidoc", ".txt", ".org", ".tex"}
+)
+CODE_NAMES = frozenset({"Dockerfile", "Makefile", "Jenkinsfile", "BUILD", "WORKSPACE"})
+
+SECRET_NAMES = frozenset(
+    {
+        ".env", ".netrc", ".npmrc", ".pypirc", ".htpasswd", ".git-credentials",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials", "secrets",
+        "secret", "master.key", "wp-config.php",
+    }
+)
+SECRET_PREFIXES = (".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx", ".ppk", ".ovpn")
+SECRET_WORDS = ("secret", "credential", "password", "passwd", "apikey", "api_key", "privatekey")
+SECRET_WORD_EXTENSIONS = frozenset({"", ".json", ".yml", ".yaml", ".txt", ".ini", ".cfg", ".conf", ".toml", ".xml"})
+SECRET_DIRS = frozenset({".ssh", ".gnupg", ".aws", ".docker", "secrets", "private"})
+
+SECRET_MARKERS = (
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN DSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+    b"-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    b"-----BEGIN PRIVATE KEY-----",
+)
+SECRET_TOKEN_PREFIXES = (
+    b"AKIA", b"ASIA", b"ghp_", b"ghs_", b"github_pat_", b"xoxb-", b"xoxp-",
+    b"sk-ant-", b"sk-proj-", b"glpat-", b"AIza",
+)
+SNIFF_BYTES = 65536
+MAX_TIP_LISTINGS = 200
+
+_GIT_DROP = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+
+
+class ContractError(RuntimeError):
+    """The repository or the arguments do not allow a measurement."""
+
+
+def _env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if key not in _GIT_DROP}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def git(repo, *args, input=None, env=None, text=True):
+    """Run git with a clean object-database environment; fail closed on error."""
+    if text and isinstance(input, bytes):
+        input = input.decode("utf-8", "replace")
+    done = subprocess.run(
+        ("git", "-C", str(repo), *args),
+        input=input,
+        capture_output=True,
+        text=text,
+        env=_env(env),
+        check=False,
+    )
+    if done.returncode != 0:
+        stderr = done.stderr if text else done.stderr.decode("utf-8", "replace")
+        raise ContractError("git %s -> %s" % (" ".join(args[:2]), stderr.strip()[:300] or "exit %d" % done.returncode))
+    return done.stdout
+
+
+def git_maybe(repo, *args, text=True):
+    try:
+        return git(repo, *args, text=text)
+    except ContractError:
+        return None
+
+
+def object_format(repo) -> str:
+    out = git_maybe(repo, "rev-parse", "--show-object-format")
+    return (out or "").strip() or "sha1"
+
+
+def object_id(data: bytes, fmt: str) -> str:
+    """Recompute the object name of a blob from its bytes, outside the ODB."""
+    digest = hashlib.sha256() if fmt == "sha256" else hashlib.sha1()
+    digest.update(b"blob %d\0" % len(data))
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def worktree_heads(repo) -> list[str]:
+    """Every worktree HEAD, including detached ones that no ref points at."""
+    out = git_maybe(repo, "worktree", "list", "--porcelain") or ""
+    return [line[5:].strip() for line in out.splitlines() if line.startswith("HEAD ")]
+
+
+def _object_types(repo, oids) -> dict[str, tuple[str, int]]:
+    if not oids:
+        return {}
+    payload = "".join(oid + "\n" for oid in oids)
+    out = git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", input=payload)
+    types = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            types[parts[0]] = (parts[1], int(parts[2]))
+    return types
+
+
+def _blobs(repo, listing: str) -> dict[str, str]:
+    """`<oid> <path>` lines reduced to the blobs: commits and trees carry no usable path."""
+    candidates = {}
+    for line in listing.splitlines():
+        oid, _, path = line.partition(" ")
+        if path and not path.startswith("@"):
+            candidates[path] = oid
+    types = _object_types(repo, sorted(set(candidates.values())))
+    return {path: oid for path, oid in candidates.items() if types.get(oid, ("", 0))[0] == "blob"}
+
+
+def _tree_blobs(listing: str) -> dict[str, str]:
+    """`<mode> <type> <oid>\\t<path>` from `ls-tree -r` -> {path: oid}, blobs only.
+
+    Unlike an object walk, `ls-tree` names every path, so a file whose bytes already
+    live at another path is still visible and can be classified as MOVED.
+    """
+    paths = {}
+    for line in listing.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and path:
+            paths[path] = parts[2]
+    return paths
+
+
+def ref_tips(repo) -> list[str]:
+    """Commit oids behind every ref, sorted and deduplicated."""
+    out = git_maybe(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)") or ""
+    tips = set()
+    for line in out.splitlines():
+        parts = line.split("\0")
+        if len(parts) == 3 and parts[1] == "commit" and parts[2]:
+            tips.add(parts[2])
+    return sorted(tips)
+
+
+
+def is_secret_path(path: str) -> bool:
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return False
+    name = parts[-1].lower()
+    if any(part.lower() in SECRET_DIRS for part in parts[:-1]):
+        return True
+    if name in SECRET_NAMES or name.startswith(SECRET_PREFIXES):
+        return True
+    if any(name.endswith(suffix) for suffix in SECRET_SUFFIXES):
+        return True
+    stem, ext = os.path.splitext(name)
+    if ext in SECRET_WORD_EXTENSIONS and any(word in stem for word in SECRET_WORDS):
+        return True
+    return False
+
+
+def looks_secret(data: bytes) -> bool:
+    head = data[:SNIFF_BYTES]
+    if any(marker in head for marker in SECRET_MARKERS):
+        return True
+    return any(token in head for token in SECRET_TOKEN_PREFIXES)
+
+
+def _is_code(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return name in CODE_NAMES or os.path.splitext(name)[1].lower() in CODE_EXTENSIONS
+
+
+def _is_doc(path: str) -> bool:
+    return os.path.splitext(path.rsplit("/", 1)[-1])[1].lower() in DOC_EXTENSIONS
+
+
+def audit(
+    repo,
+    include_worktrees: bool = True,
+    include_unreachable: bool = False,
+    max_tip_listings: int = MAX_TIP_LISTINGS,
+) -> dict:
+    """Measure the complement. Writes nothing; every number here is a reading.
+
+    Two readings are merged on purpose. The object walk covers the whole history but
+    names one path per distinct blob; the per-tip `ls-tree` pass names every path of
+    every ref tip and worktree HEAD, which is where content about to be lost lives.
+    """
+    root = pathlib.Path(repo).expanduser()
+    if not root.is_dir():
+        raise ContractError("not a directory: %s" % repo)
+    top = git_maybe(root, "rev-parse", "--show-toplevel")
+    if top is None:
+        raise ContractError("not a git repository: %s" % repo)
+    root = pathlib.Path(top.strip())
+    fmt = object_format(root)
+    head = (git_maybe(root, "rev-parse", "--verify", "HEAD") or "").strip()
+
+    head_paths = _tree_blobs(git(root, "ls-tree", "-r", head)) if head else {}
+    head_oids = set(head_paths.values())
+
+    worktrees = sorted({sha for sha in worktree_heads(root) if sha})
+    extras = [sha for sha in worktrees if sha != head]
+
+    walk = ["rev-list", "--objects", "--all"]
+    if extras and not include_worktrees:
+        walk += ["--not", *extras]
+    complement = _blobs(root, git(root, *walk))
+
+    tips = ref_tips(root) + (extras if include_worktrees else [])
+    exact_tips = sorted(set(tips))
+    listed_exactly = len(exact_tips) <= max_tip_listings
+    if listed_exactly:
+        for tip in exact_tips:
+            listing = git_maybe(root, "ls-tree", "-r", tip)
+            if listing:
+                for path, oid in _tree_blobs(listing).items():
+                    complement.setdefault(path, oid)
+
+    findings = []
+    for path in sorted(complement):
+        if path in head_paths:
+            continue
+        oid = complement[path]
+        if oid in head_oids:
+            kind = MOVED
+        elif is_secret_path(path):
+            kind = ORPHAN_SECRET_RISK
+        elif _is_code(path):
+            kind = ORPHAN_CODE
+        elif _is_doc(path):
+            kind = ORPHAN_DOC
+        else:
+            kind = RESIDUE
+        findings.append({"class": kind, "path": path, "oid": oid})
+
+    unreachable = 0
+    if include_unreachable:
+        listing = git_maybe(root, "fsck", "--unreachable", "--no-reflogs", "--no-progress") or ""
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) != 3 or parts[1] != "blob":
+                continue
+            oid = parts[2]
+            unreachable += 1
+            path = "@unreachable/" + oid
+            content = git(root, "cat-file", "blob", oid, text=False)[:SNIFF_BYTES]
+            findings.append(
+                {
+                    "class": ORPHAN_SECRET_RISK if looks_secret(content) else RESIDUE,
+                    "path": path,
+                    "oid": oid,
+                }
+            )
+
+    sizes = _object_types(root, sorted({f["oid"] for f in findings}))
+    for finding in findings:
+        finding["size"] = sizes.get(finding["oid"], ("", 0))[1]
+    findings.sort(key=lambda f: (CLASSES.index(f["class"]), f["path"], f["oid"]))
+
+    counts = {kind: sum(1 for f in findings if f["class"] == kind) for kind in CLASSES}
+    refs = len((git_maybe(root, "for-each-ref", "--format=%(refname)") or "").splitlines())
+    outside = git_maybe(
+        root, "rev-list", "--count", "--all", *extras, *(["--not", head] if head else [])
+    )
+    reported_worktrees = len(worktrees) if include_worktrees else 1
+    return {
+        "schema": 1,
+        "tool": "git-complement-audit",
+        "version": __version__,
+        "repo": {
+            "head": head,
+            "object_format": fmt,
+            "refs": refs,
+            "worktrees": reported_worktrees,
+            "commits_outside_head": int((outside or "0").strip().splitlines()[0] or 0),
+        },
+        "scope": {
+            "all refs except HEAD": True,
+            "worktree HEADs": bool(include_worktrees),
+            "every path of each ref tip": listed_exactly,
+            "ref tips": len(exact_tips),
+            "ref tip listing limit": max_tip_listings,
+            "unreachable objects": bool(include_unreachable),
+        },
+        "universe": {
+            "paths": len(findings),
+            "blobs": len({f["oid"] for f in findings}),
+            "bytes": sum(f["size"] for f in findings),
+            "unreachable_scanned": unreachable if include_unreachable else 0,
+        },
+        "counts": counts,
+        "findings": findings,
+    }
+
+
+def has_failure(report: dict) -> bool:
+    return any(report["counts"][kind] for kind in FAILING)
+
+
+def _safe_relative(path: str) -> str:
+    parts = [part for part in path.split("/") if part not in ("", ".", "..")]
+    return "/".join(parts) or "blob"
+
+
+def _lock_down(path: pathlib.Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def rescue(repo, report: dict, dest) -> list[dict]:
+    """Copy rescuable blobs outside the ODB with 0700/0600 and a verified re-hash."""
+    root = pathlib.Path(repo)
+    target_root = pathlib.Path(dest).expanduser()
+    target_root.mkdir(parents=True, exist_ok=True)
+    _lock_down(target_root, 0o700)
+    fmt = report["repo"]["object_format"]
+
+    rows = []
+    for finding in report["findings"]:
+        if finding["class"] not in RESCUABLE:
+            continue
+        data = git(root, "cat-file", "blob", finding["oid"], text=False)
+        if object_id(data, fmt) != finding["oid"]:
+            raise ContractError(
+                "re-hash mismatch for %s: expected %s, got %s"
+                % (finding["path"], finding["oid"], object_id(data, fmt))
+            )
+        relative = "%s/%s" % (finding["class"], _safe_relative(finding["path"]))
+        target = target_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        _lock_down(target, 0o600)
+        walked = target.parent
+        while walked != target_root.parent:
+            _lock_down(walked, 0o700)
+            if walked == target_root:
+                break
+            walked = walked.parent
+        rows.append({"path": relative, "oid": finding["oid"], "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)})
+
+    rows.sort(key=lambda row: row["path"])
+    sums = target_root / "SHA256SUMS"
+    sums.write_text("".join("%s  %s\n" % (row["sha256"], row["path"]) for row in rows), encoding="utf-8")
+    _lock_down(sums, 0o600)
+    manifest = {
+        "schema": 1,
+        "tool": "git-complement-audit",
+        "version": __version__,
+        "head": report["repo"]["head"],
+        "object_format": fmt,
+        "classes": list(RESCUABLE),
+        "files": rows,
+    }
+    manifest_path = target_root / "MANIFEST.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _lock_down(manifest_path, 0o600)
+    return rows
+
+
+def receipt(repo, report: dict, path) -> str:
+    """Write a deterministic pre-GC receipt; the same repository yields the same bytes."""
+    root = pathlib.Path(repo)
+    findings = []
+    for finding in report["findings"]:
+        data = git(root, "cat-file", "blob", finding["oid"], text=False)
+        findings.append(dict(finding, sha256=hashlib.sha256(data).hexdigest()))
+    document = {
+        "schema": 1,
+        "tool": "git-complement-audit",
+        "version": __version__,
+        "repo": report["repo"],
+        "scope": report["scope"],
+        "universe": report["universe"],
+        "counts": report["counts"],
+        "findings": findings,
+    }
+    payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    destination = pathlib.Path(path).expanduser()
+    if destination.parent != pathlib.Path(""):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(payload, encoding="utf-8")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def render(report: dict) -> str:
+    repo, universe, counts = report["repo"], report["universe"], report["counts"]
+    included = [key for key, value in report["scope"].items() if value is True]
+    lines = [
+        "SCOPE     head=%s object-format=%s refs=%d worktrees=%d commits-outside-head=%d"
+        % (
+            repo["head"][:12] or "(unborn)",
+            repo["object_format"],
+            repo["refs"],
+            repo["worktrees"],
+            repo["commits_outside_head"],
+        ),
+        "INCLUDED  %s" % "; ".join(included),
+        "UNIVERSE  paths-outside-head=%d blobs=%d bytes=%d"
+        % (universe["paths"], universe["blobs"], universe["bytes"]),
+        "CLASSES   %s" % " · ".join("%s=%d" % (kind, counts[kind]) for kind in CLASSES),
+    ]
+    if not report["scope"]["every path of each ref tip"]:
+        lines.append(
+            "NOTE      per-tip listing skipped: %d ref tips > limit %d, so MOVED can be "
+            "under-reported; re-run with --ref-tips %d"
+            % (
+                report["scope"]["ref tips"],
+                report["scope"]["ref tip listing limit"],
+                2 * report["scope"]["ref tips"],
+            )
+        )
+    for finding in report["findings"]:
+        lines.append("  %-18s %9d B  %s" % (finding["class"], finding["size"], finding["path"]))
+    failing = [kind for kind in FAILING if counts[kind]]
+    if failing:
+        total = sum(counts[kind] for kind in failing)
+        lines.append(
+            "VERDICT   RC 1 — %d finding(s) outside HEAD need a rescue or a commit (%s)"
+            % (total, ", ".join("%s=%d" % (kind, counts[kind]) for kind in failing))
+        )
+    else:
+        lines.append("VERDICT   RC 0 — no orphaned code or secrets outside HEAD")
+    return "\n".join(lines)
