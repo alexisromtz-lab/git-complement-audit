@@ -308,3 +308,11 @@ credential at a path that still exists in `HEAD` is declared in the universe bef
 ## License
 
 MIT.
+
+## Field notes
+
+This repository belongs to an audit corpus whose measurements are published as
+field notes. Two of them come from the same work:
+
+- [El bug que responde SUCCESS: auditoría reproducible de litellm#46923](https://dev.to/alexisromtz7/el-bug-que-responde-success-auditoria-reproducible-de-litellm46923-ad6)
+- [The bug that answers SUCCESS: a reproducible audit of litellm#46923](https://dev.to/alexisromtz7/the-bug-that-answers-success-a-reproducible-audit-of-litellm46923-15lk)
