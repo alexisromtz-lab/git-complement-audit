@@ -119,7 +119,7 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(secrets, ["deep/.env"])
 
     def test_credential_at_a_path_that_still_exists_in_head_is_declared_and_read(self) -> None:
-        repo = make_repo(self.box, {"app.py": "KEY = 'AKIAIOSFODNN7EXAMPLE'\n"})
+        repo = make_repo(self.box, {"app.py": "KEY = '%s%s'\n" % ("AKIA", "IOSFODNN7EXAMPLE")})
         silent = audit(str(repo), "--json")
         self.assertEqual(silent.returncode, 0, silent.stderr)
         report = json.loads(silent.stdout)
@@ -188,6 +188,43 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(audit(str(repo), "--receipt", str(first), "--quiet").returncode, 1)
         audit(str(repo), "--receipt", str(second), "--quiet")
         self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_a_declared_exemption_moves_a_secret_out_of_the_gate(self) -> None:
+        repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n"})
+        self.assertEqual(audit(str(repo), "--quiet").returncode, 1)
+        oid = git(repo, "hash-object", "--stdin", input="TOKEN=1\n").strip()
+        declaration = repo / ".git-complement-audit-ignore"
+        declaration.write_text("%s  # rotated upstream\n" % oid, encoding="utf-8")
+
+        done = audit(str(repo), "--json")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        report = json.loads(done.stdout)
+        self.assertEqual(report["counts"]["ORPHAN_SECRET_RISK"], 0)
+        self.assertEqual(report["counts"]["EXEMPT_SECRET"], 1)
+        self.assertEqual(report["exemptions"], {"file": ".git-complement-audit-ignore",
+                                                "declared": 1, "applied": 1, "unused": []})
+        self.assertEqual([(f["class"], f["declared"]) for f in report["findings"]],
+                         [("EXEMPT_SECRET", "ORPHAN_SECRET_RISK")])
+        printed = audit(str(repo))
+        self.assertEqual(printed.returncode, 0, printed.stderr)
+        self.assertIn("EXEMPT", printed.stdout)
+
+        declaration.write_text("%s-not-a-blob-id\n" % "AKIA", encoding="utf-8")
+        broken = audit(str(repo), "--quiet")
+        self.assertEqual(broken.returncode, 2)
+        self.assertIn("CONTRACT", broken.stderr)
+
+    def test_an_exemption_cannot_silence_orphan_code(self) -> None:
+        repo = make_repo(self.box, {"lost/handler.py": "def f():\n    return 1\n"})
+        oid = git(repo, "hash-object", "--stdin", input="def f():\n    return 1\n").strip()
+        (repo / ".git-complement-audit-ignore").write_text("%s\n" % oid, encoding="utf-8")
+        done = audit(str(repo), "--json")
+        self.assertEqual(done.returncode, 1, done.stderr)
+        report = json.loads(done.stdout)
+        self.assertEqual(report["counts"]["ORPHAN_CODE"], 1)
+        self.assertEqual(report["counts"]["EXEMPT_SECRET"], 0)
+        self.assertEqual(report["exemptions"]["applied"], 0)
+        self.assertEqual(report["exemptions"]["unused"], [oid])
 
     def test_rescue_writes_private_files_verifiable_outside_the_object_database(self) -> None:
         repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n", "lost/handler.py": "def f():\n    pass\n"})

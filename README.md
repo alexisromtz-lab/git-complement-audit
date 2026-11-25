@@ -38,7 +38,7 @@ INCLUDED  all refs except HEAD; worktree HEADs; every path of each ref tip
 HIDDEN    runtime namespaces: refs/agents/1
 UNIVERSE  paths-outside-head=8 blobs=8 bytes=167
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=off
-CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0
+CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
 NOTE      1 blob(s) outside HEAD are named by no path row — their path is still in HEAD, or another blob took it — so their contents were not read; a credential there survives in every clone; --scan-history reads them
   MOVED                     15 B  app_copy.py
   ORPHAN_CODE               27 B  orphan/handler.py
@@ -55,15 +55,29 @@ Add `--scan-history` and the one blob no path row could name is read too:
 
 ```
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=on
+CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=1 · EXEMPT_SECRET=0
   HISTORY_SECRET_RISK        28 B  README.md  [history]
 VERDICT   RC 1 — 6 finding(s) outside HEAD need a rescue, a commit or a rotation (ORPHAN_CODE=3, ORPHAN_SECRET_RISK=2, HISTORY_SECRET_RISK=1)
+```
+
+Declare those two blob ids in `.git-complement-audit-ignore` and the same repository reads
+the other way — nothing is lost, and the claim is still on the page:
+
+```
+EXEMPT    .git-complement-audit-ignore declared=2 applied=2 unused=0
+CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=1 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=2
+  EXEMPT_SECRET             22 B  .env  [ORPHAN_SECRET_RISK → declared at .git-complement-audit-ignore:2]
+  EXEMPT_SECRET             28 B  README.md  [HISTORY_SECRET_RISK → declared at .git-complement-audit-ignore:1]
+VERDICT   RC 1 — 4 finding(s) outside HEAD need a rescue, a commit or a rotation (ORPHAN_CODE=3, ORPHAN_SECRET_RISK=1)
 ```
 
 ## Classes
 
 Every path that is not in `HEAD` gets exactly one class. The order is the order of the list:
 the first test that matches wins, so a secret is reported as a secret even if it also looks
-like code, and a moved file is never reported as an orphan.
+like code, and a moved file is never reported as an orphan. The last row is the exception: a
+declaration is applied after the other six have spoken, and it can only replace a secret
+claim, never a lost path.
 
 | class | meaning | fails the gate | rescuable |
 |---|---|---|---|
@@ -73,11 +87,12 @@ like code, and a moved file is never reported as an orphan.
 | `ORPHAN_DOC` | documentation or data outside `HEAD` | no | yes |
 | `RESIDUE` | build output, caches, archives: not worth rescuing | no | no |
 | `HISTORY_SECRET_RISK` | a blob outside `HEAD` that no path row can name and whose first 64 KiB look like a token — reported only under `--scan-history` | **yes** | **no: rotate it** |
+| `EXEMPT_SECRET` | a claim of danger whose exact blob id is declared in `.git-complement-audit-ignore`, with the class it replaced — see [Exemptions](#exemptions-by-content-address) | no | no |
 
-The first five are decided by the path; the last one is decided by the content, because its
-path is not evidence of anything: it still exists in `HEAD`, holding a different blob. A
-credential in that state is not something to copy to a rescue directory and keep — it is
-something to revoke, which is why it is the one failing class the rescue refuses to write.
+The first six are decided by the path, or by the content where the path is not evidence; the
+last one is decided by a declaration and only ever replaces the two secret classes. A
+credential in `HISTORY_SECRET_RISK` is not something to copy to a rescue directory and keep —
+it is something to revoke, which is why it is a failing class the rescue refuses to write.
 
 ## Exit codes
 
@@ -129,6 +144,35 @@ It is not the default because it reads content the audit otherwise only classifi
 and on a large object database that is the expensive pass. It is not silent either: `scan=off`
 with `unnamed>0` always prints what was left unread.
 
+## Exemptions, by content address
+
+An audit that cannot be run on its own repository is an opinion, not an instrument. The
+commonest way that happens is a detector whose own source spells out the tokens it looks for:
+every historical copy of the file then matches, nothing can clean the past without rewriting
+published objects, and the gate stays red forever. `.git-complement-audit-ignore` is the way
+out, and it is deliberately narrow:
+
+```gitignore
+# one blob id per line, with an optional reason after '#'
+0770ac7bf8ebb5e67edce2fea58110217d6374ac  # its bytes named this tool's dictionary, not a credential
+```
+
+- **By object id, never by name.** An exemption costs a content address; it cannot be handed
+  to a directory, a glob or a file name, and it cannot outlive the bytes it names.
+- **Only a claim of danger.** `ORPHAN_SECRET_RISK` and `HISTORY_SECRET_RISK` are the only
+  eligible classes. A blob missing from `HEAD` is evidence of loss, and no declaration in the
+  audited repository may quiet it.
+- **Always declared.** Every run prints `EXEMPT … declared=N applied=N unused=N`, and each
+  exempted row keeps the class it replaced. A declaration that never fires is named on a
+  `NOTE` line instead of being quietly ignored, and a malformed line stops the run with RC 2.
+- **Nothing is written.** Withdrawing the file restores the finding, byte for byte; the fixture
+  checks exactly that.
+
+The tool audits itself this way: six historical copies of `engine.py` and `selfcheck.py`, from
+before the detector learned to assemble its markers at run time, are declared in
+[`.git-complement-audit-ignore`](.git-complement-audit-ignore). `--scan-history` on this
+repository exits 0 with `EXEMPT_SECRET=6`, and every future blob is clean by construction.
+
 ## Flags
 
 | flag | effect |
@@ -140,6 +184,7 @@ with `unnamed>0` always prints what was left unread.
 | `--scan-history` | read the blobs outside `HEAD` that no path row can name, and fail on a credential among them — see [below](#the-blob-that-no-path-can-name) |
 | `--exclude-ref GLOB` | leave out refs matching a glob, repeatable; noise dropped, secrets kept — see [below](#repositories-driven-by-an-agent-runtime) |
 | `--allow-excluded-secrets` | with `--exclude-ref`, also drop secrets from those refs (declared in `scope`) |
+| `--ignore-file PATH` | exemption file of declared blob ids (default: `.git-complement-audit-ignore` at the repository root, if present) — see [Exemptions](#exemptions-by-content-address) |
 | `--ref-tips N` | list every path of each ref tip while tips ≤ N (default 200) |
 | `--no-worktrees` | ignore detached worktree HEADs |
 | `--quiet` | print nothing unless the contract breaks |
@@ -264,7 +309,7 @@ As a `pre-commit` hook, add to `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/alexisromtz-lab/git-complement-audit
-  rev: v1.3.0
+  rev: v1.3.1
   hooks:
     - id: git-complement-audit
 ```
@@ -277,11 +322,12 @@ git-complement-audit --self-test
 
 Builds a throwaway repository in a temporary directory — three refs, a detached worktree, one
 file per class, a secret inside a runtime ref, a secret at a path that still exists in `HEAD`,
-one dangling secret — audits it every way the flags allow, rescues it, and checks the result:
+one dangling secret — audits it every way the flags allow, declares an exemption and withdraws
+it, rescues it, and checks the result:
 
 ```
-SELF-TEST passed: 51 checks on a synthetic repository
-fixture classes: MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0
+SELF-TEST passed: 67 checks on a synthetic repository
+fixture classes: MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
 fixture verdict: RC 1 · rescue 6 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2
 ```
 
@@ -289,15 +335,21 @@ The fixture uses fixed commit dates, so its `HEAD` is `23831f083fa6…` on any m
 numbers above stop matching, the engine changed — not the environment.
 
 `python -m unittest discover -s tests` adds the boundary contract: exit codes, receipt
-determinism between two runs, the `0700`/`0600` permissions of a rescue, and the fact that a
-credential at a path that still exists in `HEAD` is declared in the universe before it is read.
+determinism between two runs, the `0700`/`0600` permissions of a rescue, the fact that a
+credential at a path that still exists in `HEAD` is declared in the universe before it is read,
+and that a declared exemption moves a secret out of the gate while leaving orphan code failing.
 
 ## Limits, stated
 
 - It audits one repository at a time; the object database is the unit, not the filesystem.
 - `--unreachable` finds objects no ref reaches, but a blob that was never written cannot be found.
-- Secret detection is path- and prefix-based on the first 64 KiB. It flags risk; it does not
-  prove a credential is live.
+- Secret detection is path-based, plus a token *shape* — a known prefix followed by a body of
+  a known length — over the first 64 KiB. It flags risk; it does not prove a credential is live,
+  and a token split across lines or stored without its prefix is not seen.
+- An exemption reduces the gate only for the blob id it names, and the run always says how many
+  it spent and how many never fired. It is a record of a decision, not a way to switch the
+  detector off: the two classes it can touch are the secret ones, and even then the row stays
+  on the page with the class it replaced.
 - Without `--scan-history` the unnamed blobs are counted but not read. That is a declared
   skip, printed on every run where it happens; it is not a zero.
 - A secret at a path that *is* outside `HEAD` but does not look like one (`config.py` with a

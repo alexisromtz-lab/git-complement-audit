@@ -33,11 +33,18 @@ network client, no plugin system.
    labelled with its origin, because a ref an agent wrote by accident is exactly where a
    committed `.env` hides. Dropping those too requires `--allow-excluded-secrets`, and the
    report must say the scan was off. A smaller report may never be a quieter one.
+10. **An exemption is a record, not a switch.** `.git-complement-audit-ignore` grants a class
+    change to a blob id — never to a name, a glob or a directory — and only for
+    `ORPHAN_SECRET_RISK` and `HISTORY_SECRET_RISK`. It is applied after the six classes have
+    spoken, the replaced class is kept on the row, and every run prints `declared`, `applied`
+    and `unused`. The file is read, never written: withdrawing it restores the finding. A
+    detector whose own vocabulary trips it must fix the predicate and, for the blobs already
+    published, declare them here in the same commit.
 
 ## Verification, before any commit
 
 ```bash
-python -m git_complement_audit --self-test          # 51 in-process checks, RC 0
+python -m git_complement_audit --self-test          # 67 in-process checks, RC 0
 python -m unittest discover -s tests                # CLI contract, RC 0
 ```
 
@@ -49,9 +56,10 @@ state why in the commit message.
 Classes are mutually exclusive and total. `engine.CLASSES` fixes the order, and the first test
 that matches wins: `MOVED` → `ORPHAN_SECRET_RISK` → `ORPHAN_CODE` → `ORPHAN_DOC` → `RESIDUE`,
 then `HISTORY_SECRET_RISK`, which is decided by content after the path loop and therefore
-cannot be reached by a path at all. A new class needs, in the same commit: the constant, the
-order, the `FAILING` decision, the README table, and a fixture file in `selfcheck.py` that
-lands in it.
+cannot be reached by a path at all, and last `EXEMPT_SECRET`, which is not a test at all: it is
+the declaration of `.git-complement-audit-ignore`, applied to the two secret classes by blob
+id. A new class needs, in the same commit: the constant, the order, the `FAILING` decision, the
+README table, and a fixture file in `selfcheck.py` that lands in it.
 
 ## Publishing the universe
 

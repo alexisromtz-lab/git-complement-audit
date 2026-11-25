@@ -23,10 +23,22 @@ ORPHAN_SECRET_RISK = "ORPHAN_SECRET_RISK"
 ORPHAN_DOC = "ORPHAN_DOC"
 RESIDUE = "RESIDUE"
 HISTORY_SECRET_RISK = "HISTORY_SECRET_RISK"
+EXEMPT_SECRET = "EXEMPT_SECRET"
 
-CLASSES = (MOVED, ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC, RESIDUE, HISTORY_SECRET_RISK)
+CLASSES = (
+    MOVED,
+    ORPHAN_CODE,
+    ORPHAN_SECRET_RISK,
+    ORPHAN_DOC,
+    RESIDUE,
+    HISTORY_SECRET_RISK,
+    EXEMPT_SECRET,
+)
 RESCUABLE = (ORPHAN_CODE, ORPHAN_SECRET_RISK, ORPHAN_DOC)
 FAILING = (ORPHAN_CODE, ORPHAN_SECRET_RISK, HISTORY_SECRET_RISK)
+# An exemption is only ever granted to a claim of danger. A blob that is *absent* from
+# HEAD is evidence of loss, and no declaration in the audited repository may quiet it.
+EXEMPTABLE = (ORPHAN_SECRET_RISK, HISTORY_SECRET_RISK)
 
 CODE_EXTENSIONS = frozenset(
     {
@@ -54,20 +66,52 @@ SECRET_WORDS = ("secret", "credential", "password", "passwd", "apikey", "api_key
 SECRET_WORD_EXTENSIONS = frozenset({"", ".json", ".yml", ".yaml", ".txt", ".ini", ".cfg", ".conf", ".toml", ".xml"})
 SECRET_DIRS = frozenset({".ssh", ".gnupg", ".aws", ".docker", "secrets", "private"})
 
-SECRET_MARKERS = (
-    b"-----BEGIN RSA PRIVATE KEY-----",
-    b"-----BEGIN DSA PRIVATE KEY-----",
-    b"-----BEGIN EC PRIVATE KEY-----",
-    b"-----BEGIN OPENSSH PRIVATE KEY-----",
-    b"-----BEGIN PGP PRIVATE KEY BLOCK-----",
-    b"-----BEGIN PRIVATE KEY-----",
+def _pem(label: bytes) -> bytes:
+    """A PEM armour line assembled from parts.
+
+    Spelling the armour out as a literal would put the detector's own dictionary inside
+    the detector, and every historical copy of this file would match it: a relation that
+    satisfies its own definition names no credential, it names itself.
+    """
+    return b"-" * 5 + b"BEGIN " + label + b"-" * 5
+
+
+SECRET_MARKERS = tuple(
+    _pem(label)
+    for label in (
+        b"RSA PRIVATE KEY",
+        b"DSA PRIVATE KEY",
+        b"EC PRIVATE KEY",
+        b"OPENSSH PRIVATE KEY",
+        b"PGP PRIVATE KEY BLOCK",
+        b"PRIVATE KEY",
+    )
 )
-SECRET_TOKEN_PREFIXES = (
-    b"AKIA", b"ASIA", b"ghp_", b"ghs_", b"github_pat_", b"xoxb-", b"xoxp-",
-    b"sk-ant-", b"sk-proj-", b"glpat-", b"AIza",
+# A prefix alone is a hint, not a finding: `b"AKIA"` occurs in this very table, in prose,
+# and in half the world's tutorials. A real token carries a body of a known length, and
+# only that body makes the claim.
+TOKEN_SHAPES = (
+    (b"AKIA", 16),
+    (b"ASIA", 16),
+    (b"ghp_", 20),
+    (b"ghs_", 20),
+    (b"github_pat_", 20),
+    (b"xoxb-", 12),
+    (b"xoxp-", 12),
+    (b"sk-ant-", 20),
+    (b"sk-proj-", 20),
+    (b"glpat-", 18),
+    (b"AIza", 30),
+)
+_TOKEN_BODY = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 )
 SNIFF_BYTES = 65536
 MAX_TIP_LISTINGS = 200
+
+# Exemptions are keyed by object id, never by name or glob: granting one costs a content
+# address, so it cannot be handed to a directory, and it cannot outlive the bytes it names.
+IGNORE_NAME = ".git-complement-audit-ignore"
 
 # Namespaces an agent runtime writes on its own. They are counted even when they are
 # excluded, because "clean" must not mean "I stopped looking".
@@ -262,11 +306,45 @@ def is_secret_path(path: str) -> bool:
     return False
 
 
+def _shaped_token(head: bytes) -> bool:
+    for prefix, minimum in TOKEN_SHAPES:
+        at = head.find(prefix)
+        while at >= 0:
+            body = head[at + len(prefix) : at + len(prefix) + minimum]
+            if len(body) == minimum and all(char in _TOKEN_BODY for char in body):
+                return True
+            at = head.find(prefix, at + 1)
+    return False
+
+
 def looks_secret(data: bytes) -> bool:
     head = data[:SNIFF_BYTES]
     if any(marker in head for marker in SECRET_MARKERS):
         return True
-    return any(token in head for token in SECRET_TOKEN_PREFIXES)
+    return _shaped_token(head)
+
+
+def read_exemptions(root, path=None) -> tuple[dict[str, str], str]:
+    """`{oid: "file:line"}` from the repository's own declaration file. Reads, never writes."""
+    if path is None:
+        target = pathlib.Path(root) / IGNORE_NAME
+        if not target.is_file():
+            return {}, ""
+        label = IGNORE_NAME
+    else:
+        target = pathlib.Path(path).expanduser()
+        if not target.is_file():
+            raise ContractError("exemption file not found: %s" % path)
+        label = target.name
+    exempt: dict[str, str] = {}
+    for number, line in enumerate(target.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        text = line.split("#", 1)[0].strip().lower()
+        if not text:
+            continue
+        if any(char not in "0123456789abcdef" for char in text):
+            raise ContractError("%s:%d is not a blob id: %s" % (label, number, text[:16]))
+        exempt[text] = "%s:%d" % (label, number)
+    return exempt, label
 
 
 def _is_code(path: str) -> bool:
@@ -286,6 +364,7 @@ def audit(
     exclude_refs=(),
     allow_excluded_secrets: bool = False,
     scan_history: bool = False,
+    ignore_file=None,
 ) -> dict:
     """Measure the complement. Writes nothing; every number here is a reading.
 
@@ -300,6 +379,8 @@ def audit(
     if top is None:
         raise ContractError("not a git repository: %s" % repo)
     root = pathlib.Path(top.strip())
+    # Read the declaration before measuring: a malformed line must fail the run, not a row.
+    exempt, exempt_label = read_exemptions(root, ignore_file)
     fmt = object_format(root)
     head = (git_maybe(root, "rev-parse", "--verify", "HEAD") or "").strip()
 
@@ -415,6 +496,28 @@ def audit(
     sizes = _object_types(root, sorted({f["oid"] for f in findings}))
     for finding in findings:
         finding["size"] = sizes.get(finding["oid"], ("", 0))[1]
+
+    # An exemption is granted to a claim of danger, by content address, and only after the
+    # claim has been made: the class it replaces stays recorded so the act is auditable.
+    applied: list[str] = []
+    for finding in findings:
+        if finding["class"] not in EXEMPTABLE:
+            continue
+        locus = exempt.get(finding["oid"])
+        if locus is None:
+            continue
+        finding["declared"] = finding["class"]
+        finding["class"] = EXEMPT_SECRET
+        finding["exemption"] = locus
+        applied.append(finding["oid"])
+    spent = set(applied)
+    exemptions = {
+        "file": exempt_label,
+        "declared": len(exempt),
+        "applied": len(applied),
+        "unused": sorted(oid for oid in exempt if oid not in spent),
+    }
+
     findings.sort(key=lambda f: (CLASSES.index(f["class"]), f["path"], f["oid"]))
 
     counts = {kind: sum(1 for f in findings if f["class"] == kind) for kind in CLASSES}
@@ -446,6 +549,7 @@ def audit(
             "exclude-ref patterns": list(exclude_refs),
             "excluded secret scan": excluded_scan,
             "history scan": "on" if scan_history else "off",
+            "exemption file": exempt_label or "none",
         },
         "hidden_refs": hidden,
         "universe": {
@@ -458,6 +562,7 @@ def audit(
             "blobs_not_named": len(unnamed),
         },
         "counts": counts,
+        "exemptions": exemptions,
         "findings": findings,
     }
 
@@ -543,6 +648,7 @@ def receipt(repo, report: dict, path) -> str:
         "scope": report["scope"],
         "universe": report["universe"],
         "counts": report["counts"],
+        "exemptions": report["exemptions"],
         "findings": findings,
     }
     payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
@@ -581,6 +687,25 @@ def render(report: dict) -> str:
     hidden = ["%s%d" % (namespace, count) for namespace, count in report["hidden_refs"].items() if count]
     if hidden:
         lines.append("HIDDEN    runtime namespaces: %s" % " · ".join(hidden))
+    exemptions = report.get("exemptions") or {}
+    if exemptions.get("declared"):
+        lines.append(
+            "EXEMPT    %s declared=%d applied=%d unused=%d"
+            % (
+                exemptions["file"],
+                exemptions["declared"],
+                exemptions["applied"],
+                len(exemptions["unused"]),
+            )
+        )
+        if exemptions["unused"]:
+            lines.append(
+                "NOTE      %d declared exemption(s) never fired: %s"
+                % (
+                    len(exemptions["unused"]),
+                    ", ".join(oid[:12] for oid in exemptions["unused"][:8]),
+                )
+            )
     lines += [
         "UNIVERSE  paths-outside-head=%d blobs=%d bytes=%d"
         % (universe["paths"], universe["blobs"], universe["bytes"]),
@@ -611,7 +736,10 @@ def render(report: dict) -> str:
             "survives in every clone; --scan-history reads them" % universe["blobs_not_named"]
         )
     for finding in report["findings"]:
-        origin = "" if finding["root"] == "refs" else "  [%s]" % finding["root"]
+        if finding["class"] == EXEMPT_SECRET:
+            origin = "  [%s → declared at %s]" % (finding["declared"], finding["exemption"])
+        else:
+            origin = "" if finding["root"] == "refs" else "  [%s]" % finding["root"]
         lines.append(
             "  %-18s %9d B  %s%s" % (finding["class"], finding["size"], finding["path"], origin)
         )
@@ -624,10 +752,16 @@ def render(report: dict) -> str:
         )
     else:
         if universe["blobs_named"]:
-            lines.append(
+            verdict = (
                 "VERDICT   RC 0 — no orphaned code or secrets among the %d blob(s) named outside HEAD"
                 % universe["blobs_named"]
             )
         else:
-            lines.append("VERDICT   RC 0 — no path outside HEAD needs a rescue")
+            verdict = "VERDICT   RC 0 — no path outside HEAD needs a rescue"
+        if exemptions.get("applied"):
+            verdict += ", with %d secret claim(s) exempted by %s" % (
+                exemptions["applied"],
+                exemptions["file"],
+            )
+        lines.append(verdict)
     return "\n".join(lines)

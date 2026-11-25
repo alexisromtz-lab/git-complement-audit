@@ -1,0 +1,28 @@
+# Declared exemptions, by content address, for this repository only.
+#
+# A secret claim is granted an exemption only here, one blob id per line, and every run
+# prints what it spent and what it never used. No name, no glob and no directory can be
+# exempted, and no class other than ORPHAN_SECRET_RISK / HISTORY_SECRET_RISK is eligible:
+# a path that is absent from HEAD is evidence of loss, and no declaration quiets it.
+#
+# Reason for the nine below: they are the published versions of the three files that spelled
+# the detector's own dictionary out as literals. They name no credential -- they name this
+# instrument's vocabulary -- and they cannot be rewritten without breaking the object identity
+# of the published tags v1.0.0 to v1.3.0, which is the very thing this tool exists to protect.
+# From v1.3.1 the literals are assembled at run time, so every blob this repository creates
+# from here on is clean; these nine are a fixed, closed set and this file is the record of it.
+#
+# The set grew from six to nine in the same commit that made the source clean, because a
+# cleanup publishes its own predecessor: the v1.3.0 blobs left HEAD when v1.3.1 entered it,
+# and a blob with no path outside HEAD is exactly what this tool calls unnamed history.
+
+0770ac7bf8ebb5e67edce2fea58110217d6374ac  # engine.py, before v1.3.0
+0b3b939ff2f970aadebacbe9453aa540a2dc0b9c  # engine.py, before v1.3.0
+d1fb33d8b0717c334744f244d57e9aea111ef505  # engine.py, before v1.3.0
+069f29257813d5894e7f897be289c20da7bc6868  # selfcheck.py, before v1.3.0
+3410f17ac27e420b76706e4887a19b7a89e1a21e  # selfcheck.py, before v1.3.0
+7f86d0554aa496a7392ca1d69a8d2da35ed6bb6e  # selfcheck.py, before v1.3.0
+
+d6b51ff5a7586cc83e4207e908ce4c856c1daf7d  # engine.py, v1.3.0
+d574e56153b4cfb50f53ced94402679b39a085b5  # selfcheck.py, v1.3.0
+39d698c598d2447e5c0dc06fe8bd7515e497389f  # tests/test_audit.py, v1.3.0

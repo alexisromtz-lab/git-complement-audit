@@ -30,10 +30,12 @@ SIDE_FILES = {
     "build/out.bin": "\x00\x01\x02 binary\n",  # -> RESIDUE
     # Its path still exists in HEAD, so no path row can name it: the blob is only read
     # under --scan-history, and there it -> HISTORY_SECRET_RISK.
-    "README.md": "setup: AKIAIOSFODNN7EXAMPLE\n",
+    "README.md": "setup: %s%s\n" % ("AKIA", "IOSFODNN7EXAMPLE"),
 }
 WORKTREE_FILE = "scratch/agent_notes.py"
-DANGLING_SECRET = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n"
+# Assembled from parts on purpose: a fixture that spells the marker out would be a copy of
+# the detector's dictionary, and the two could agree while both being wrong.
+DANGLING_SECRET = "-----BEGIN %s-----\nnot-a-real-key\n" % "RSA PRIVATE KEY"
 AGENT_FILES = {
     "runtime/checkpoints/lost.py": "def checkpoint():\n    return 0\n",  # -> ORPHAN_CODE
     "runtime/checkpoints/.env": "AGENT_TOKEN=placeholder\n",  # -> ORPHAN_SECRET_RISK
@@ -45,6 +47,7 @@ EXPECTED = {
     engine.ORPHAN_DOC: 1,
     engine.RESIDUE: 1,
     engine.HISTORY_SECRET_RISK: 0,
+    engine.EXEMPT_SECRET: 0,
 }
 UNNAMED = 1
 
@@ -113,7 +116,7 @@ def run() -> int:
         check("head is the fixture commit", report["repo"]["head"] == head)
         check("fixture is reproducible on any machine", _init(base / "twin") == head)
         check("object format declared", report["repo"]["object_format"] in ("sha1", "sha256"))
-        check("five classes counted", report["counts"] == EXPECTED)
+        check("seven classes counted", report["counts"] == EXPECTED)
         check("worktree HEAD counted as a root", report["repo"]["worktrees"] >= 2)
         check("detached worktree commit is outside HEAD", report["repo"]["commits_outside_head"] >= 2)
         classes = {finding["class"] for finding in report["findings"]}
@@ -199,6 +202,77 @@ def run() -> int:
         check("--scan-history fails the gate", engine.has_failure(history))
         check("--scan-history returns RC 1 from the cli",
               cli.main([str(repo), "--quiet", "--scan-history"]) == cli.RC_FINDINGS)
+
+        declaration = repo / engine.IGNORE_NAME
+        history_oid = next(f["oid"] for f in history["findings"]
+                           if f["class"] == engine.HISTORY_SECRET_RISK)
+        env_oid = next(f["oid"] for f in report["findings"]
+                       if f["class"] == engine.ORPHAN_SECRET_RISK and f["path"] == ".env")
+        code_oid = next(f["oid"] for f in report["findings"]
+                        if f["class"] == engine.ORPHAN_CODE and f["path"] == "orphan/handler.py")
+        declaration.write_text(
+            "%s  # the fixture's own history credential\n"
+            "%s  # an orphaned credential: still a claim of danger\n"
+            "%s  # orphan code: no declaration may quiet a lost path\n"
+            "%s  # a blob this repository does not hold\n"
+            % (history_oid, env_oid, code_oid, "0" * len(head)),
+            encoding="utf-8",
+        )
+        exempted = engine.audit(repo, scan_history=True)
+        check("an exemption moves a declared credential out of the gate",
+              exempted["counts"][engine.EXEMPT_SECRET] == 2)
+        check("the exempted blob is still listed, with the class it replaced", any(
+            f["class"] == engine.EXEMPT_SECRET
+            and f.get("declared") == engine.HISTORY_SECRET_RISK
+            and f["path"] == "README.md"
+            and f["exemption"].startswith(engine.IGNORE_NAME + ":")
+            for f in exempted["findings"]))
+        check("an exemption cannot silence orphan code",
+              exempted["counts"][engine.ORPHAN_CODE] == EXPECTED[engine.ORPHAN_CODE])
+        check("the exemption file is declared in scope",
+              exempted["scope"]["exemption file"] == engine.IGNORE_NAME)
+        check("declarations that never fire are named, not silent",
+              exempted["exemptions"]["declared"] == 4
+              and exempted["exemptions"]["applied"] == 2
+              and len(exempted["exemptions"]["unused"]) == 2)
+        check("the render declares the exemption it spent",
+              "EXEMPT    %s declared=4 applied=2 unused=2" % engine.IGNORE_NAME
+              in engine.render(exempted))
+        check("an exempted secret still fails the gate on the code left beside it",
+              cli.main([str(repo), "--quiet", "--scan-history"]) == cli.RC_FINDINGS)
+        exempted_receipt = base / "receipt-exempt.json"
+        engine.receipt(repo, exempted, exempted_receipt)
+        check("the receipt carries the exemption block",
+              json.loads(exempted_receipt.read_text(encoding="utf-8"))["exemptions"]["applied"] == 2)
+
+        declaration.unlink()
+        restored = engine.audit(repo, scan_history=True)
+        check("withdrawing the declaration restores the claim",
+              restored["counts"][engine.HISTORY_SECRET_RISK] == 1
+              and restored["counts"][engine.EXEMPT_SECRET] == 0)
+        check("the declaration wrote nothing into the object database",
+              restored["universe"] == history["universe"])
+
+        declaration.write_text("%s-not-a-blob-id\n" % "AKIA", encoding="utf-8")
+        try:
+            engine.audit(repo)
+        except engine.ContractError:
+            check("a malformed declaration fails the run", True)
+        else:
+            check("a malformed declaration fails the run", False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            malformed = cli.main([str(repo), "--quiet"])
+        check("a malformed declaration returns RC 2", malformed == cli.RC_CONTRACT)
+        declaration.unlink()
+        with contextlib.redirect_stderr(io.StringIO()):
+            absent = cli.main([str(repo), "--quiet", "--ignore-file", str(base / "absent")])
+        check("an exemption file named on the command line must exist", absent == cli.RC_CONTRACT)
+        check("the detector does not read its own dictionary as a credential",
+              not engine.looks_secret(b'TOKEN_SHAPES = ((b"AKIA", 16),)\n'))
+        check("a bare token prefix is a hint, not a finding",
+              not engine.looks_secret(b"setup: AKIA\n"))
+        check("a token prefix with a body of known length is a finding",
+              engine.looks_secret(b"key " + b"AKIA" + b"A" * 16))
 
         rescue_dir = base / "rescue"
         rows = engine.rescue(repo, report, rescue_dir)

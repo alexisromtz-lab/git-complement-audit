@@ -76,6 +76,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --exclude-ref, also drop secret findings from those refs (declared in scope)",
     )
+    parser.add_argument(
+        "--ignore-file",
+        metavar="PATH",
+        dest="ignore_file",
+        help=(
+            "exemption file of declared blob ids to exempt from secret gates "
+            "(default: .git-complement-audit-ignore at the repository root, if present)"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="print nothing unless the contract breaks")
     parser.add_argument("--version", action="version", version="git-complement-audit " + __version__)
     parser.add_argument("--self-test", action="store_true", help="run the synthetic fixture audit and exit")
@@ -95,6 +104,7 @@ def main(argv=None) -> int:
             exclude_refs=tuple(args.exclude_refs),
             allow_excluded_secrets=args.allow_excluded_secrets,
             scan_history=args.scan_history,
+            ignore_file=args.ignore_file,
         )
         if args.rescue_dir:
             rows = engine.rescue(args.repo, report, args.rescue_dir)
