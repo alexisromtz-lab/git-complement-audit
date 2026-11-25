@@ -29,17 +29,20 @@ dependencies, so `pip install .` inside a clone works too.
 Run on the synthetic repository that `--self-test` builds (see [Verify the instrument](#verify-the-instrument)):
 
 ```
-SCOPE     head=23831f083fa6 object-format=sha1 refs=2 worktrees=2 commits-outside-head=2
+SCOPE     head=23831f083fa6 object-format=sha1 refs=3 worktrees=2 commits-outside-head=3
 INCLUDED  all refs except HEAD; worktree HEADs; every path of each ref tip
-UNIVERSE  paths-outside-head=6 blobs=6 bytes=112
-CLASSES   MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=1 · ORPHAN_DOC=1 · RESIDUE=1
+HIDDEN    runtime namespaces: refs/agents/1
+UNIVERSE  paths-outside-head=8 blobs=8 bytes=167
+CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1
   MOVED                     15 B  app_copy.py
   ORPHAN_CODE               27 B  orphan/handler.py
+  ORPHAN_CODE               31 B  runtime/checkpoints/lost.py
   ORPHAN_CODE               28 B  scratch/agent_notes.py
   ORPHAN_SECRET_RISK        22 B  .env
+  ORPHAN_SECRET_RISK        24 B  runtime/checkpoints/.env
   ORPHAN_DOC                 9 B  docs/design.md
   RESIDUE                   11 B  build/out.bin
-VERDICT   RC 1 — 3 finding(s) outside HEAD need a rescue or a commit (ORPHAN_CODE=2, ORPHAN_SECRET_RISK=1)
+VERDICT   RC 1 — 5 finding(s) outside HEAD need a rescue or a commit (ORPHAN_CODE=3, ORPHAN_SECRET_RISK=2)
 ```
 
 ## Classes
@@ -82,7 +85,8 @@ report comes from one of them, and the `INCLUDED` line says which ones ran.
 | `--rescue-dir PATH` | copy rescuable blobs outside the object database (see [Rescue](#rescue)) |
 | `--receipt PATH` | write the deterministic pre-GC receipt (see [Receipt](#receipt-before-you-delete-anything)) |
 | `--unreachable` | also scan objects no ref reaches — dropped stashes, dangling blobs |
-| `--exclude-ref GLOB` | leave out refs matching a glob, repeatable, always declared in `scope` |
+| `--exclude-ref GLOB` | leave out refs matching a glob, repeatable; noise dropped, secrets kept — see [below](#repositories-driven-by-an-agent-runtime) |
+| `--allow-excluded-secrets` | with `--exclude-ref`, also drop secrets from those refs (declared in `scope`) |
 | `--ref-tips N` | list every path of each ref tip while tips ≤ N (default 200) |
 | `--no-worktrees` | ignore detached worktree HEADs |
 | `--quiet` | print nothing unless the contract breaks |
@@ -98,7 +102,35 @@ you actually lost. Exclude them to see only what you can lose:
 git-complement-audit . --exclude-ref 'refs/agents/*'
 ```
 
-`scope` then carries `refs excluded`, so a smaller report never pretends to be a empty one.
+Excluding a ref removes its **noise** — `MOVED`, `ORPHAN_CODE`, `ORPHAN_DOC`, `RESIDUE` — but
+not its **secrets**. A commit an agent made by accident is exactly where a committed `.env`
+ends up, so the pass keeps reporting `ORPHAN_SECRET_RISK` from the refs you excluded and
+labels each such finding `[excluded refs]`:
+
+```
+EXCLUDED  patterns=refs/agents/* refs=1 tips=1 secret-scan=on
+HIDDEN    runtime namespaces: refs/agents/1
+CLASSES   MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1
+  ORPHAN_CODE               27 B  orphan/handler.py
+  ORPHAN_CODE               28 B  scratch/agent_notes.py
+  ORPHAN_SECRET_RISK        22 B  .env
+  ORPHAN_SECRET_RISK        24 B  runtime/checkpoints/.env  [excluded refs]
+```
+
+`RC` stays `1` while a secret sits inside an excluded namespace. If you want the old
+behaviour — everything inside the excluded refs ignored — ask for it explicitly:
+
+```bash
+git-complement-audit . --exclude-ref 'refs/agents/*' --allow-excluded-secrets
+```
+
+`scope` then reads `excluded secret scan: off (--allow-excluded-secrets)` and a `NOTE` line
+counts the tips that were not scanned. Silence is always declared; it is never inferred.
+
+`HIDDEN` counts the runtime namespaces that exist in the object database
+(`refs/agents/`, `refs/checkpoints/`, `refs/original/`) even when they are excluded, and
+`--json` exposes the same census as `hidden_refs`, so a clean `HEAD` and a clean `origin`
+never pass for an empty object database.
 
 ## Declared scope
 
@@ -108,6 +140,17 @@ The report never claims more than it measured:
 - `INCLUDED` lists the passes that actually ran. If more than 200 ref tips exist, the per-tip
   listing is skipped to keep the run bounded, and the report says so on a `NOTE` line —
   `MOVED` may then be under-reported. Raise the bound with `--ref-tips N`.
+- `EXCLUDED` appears only when `--exclude-ref` was used, and restates all of it: the patterns,
+  how many refs matched, how many tips were held out, and whether their secrets were scanned.
+  A finding whose origin is an excluded ref carries `root: "excluded refs"` in `--json` and the
+  `[excluded refs]` suffix in the text report; every other finding carries `root: "refs"`.
+- `HIDDEN` counts the runtime namespaces present in the object database, excluded or not, so
+  "nothing to report" and "nothing to look at" stay two different statements.
+- The secret scan over excluded refs walks the held-out tips directly, without `--not`: `--not`
+  would drop every blob shared with an included root, and a secret shared with one would
+  vanish. The pass prints one path per **distinct blob**, so two secret-named paths that hold
+  identical bytes are reported once, under one of the two. It never hides a secret; it may
+  name it under its twin path.
 - `--unreachable` adds a `git fsck` pass for objects no ref reaches at all (dropped stashes,
   dangling blobs). It is off by default because it is the slowest pass.
 
@@ -150,7 +193,7 @@ As a `pre-commit` hook, add to `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/alexisromtz-lab/git-complement-audit
-  rev: v1.0.0
+  rev: v1.2.0
   hooks:
     - id: git-complement-audit
 ```
@@ -161,13 +204,14 @@ As a `pre-commit` hook, add to `.pre-commit-config.yaml`:
 git-complement-audit --self-test
 ```
 
-Builds a throwaway repository in a temporary directory — two refs, a detached worktree, one
-file per class, one dangling secret — audits it, rescues it, and checks the result:
+Builds a throwaway repository in a temporary directory — three refs, a detached worktree, one
+file per class, a secret inside a runtime ref, one dangling secret — audits it, rescues it, and
+checks the result:
 
 ```
-SELF-TEST passed: 31 checks on a synthetic repository
-fixture classes: MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=1 · ORPHAN_DOC=1 · RESIDUE=1
-fixture verdict: RC 1 · rescue 4 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2
+SELF-TEST passed: 38 checks on a synthetic repository
+fixture classes: MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1
+fixture verdict: RC 1 · rescue 6 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2
 ```
 
 The fixture uses fixed commit dates, so its `HEAD` is `23831f083fa6…` on any machine. If the

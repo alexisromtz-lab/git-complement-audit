@@ -31,10 +31,14 @@ SIDE_FILES = {
 }
 WORKTREE_FILE = "scratch/agent_notes.py"
 DANGLING_SECRET = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n"
+AGENT_FILES = {
+    "runtime/checkpoints/lost.py": "def checkpoint():\n    return 0\n",  # -> ORPHAN_CODE
+    "runtime/checkpoints/.env": "AGENT_TOKEN=placeholder\n",  # -> ORPHAN_SECRET_RISK
+}
 EXPECTED = {
     engine.MOVED: 1,
-    engine.ORPHAN_CODE: 2,
-    engine.ORPHAN_SECRET_RISK: 1,
+    engine.ORPHAN_CODE: 3,
+    engine.ORPHAN_SECRET_RISK: 2,
     engine.ORPHAN_DOC: 1,
     engine.RESIDUE: 1,
 }
@@ -89,6 +93,9 @@ def run() -> int:
         side = _commit(repo, SIDE_FILES, "hidden ref work", parent=head)
         engine.git(repo, "update-ref", "refs/custom/hidden", side)
 
+        agent = _commit(repo, AGENT_FILES, "runtime checkpoint", parent=head)
+        engine.git(repo, "update-ref", "refs/agents/turn/1", agent)
+
         worktree = base / "wt"
         engine.git(repo, "worktree", "add", "-q", "--detach", str(worktree))
         target = worktree / WORKTREE_FILE
@@ -122,7 +129,26 @@ def run() -> int:
         check("--exclude-ref declares how many refs it left out",
               excluded["scope"]["refs excluded"] == 1)
         check("--exclude-ref keeps what the other roots still hold",
-              excluded["counts"][engine.ORPHAN_CODE] == 1)
+              excluded["counts"][engine.ORPHAN_CODE] == EXPECTED[engine.ORPHAN_CODE] - 1)
+        check("--exclude-ref keeps the secret it excluded, and names its root", any(
+            f["class"] == engine.ORPHAN_SECRET_RISK and f["path"] == ".env" and f["root"] == "excluded refs"
+            for f in excluded["findings"]))
+        check("--exclude-ref never returns RC 0 over a secret it excluded",
+              cli.main([str(repo), "--quiet", "--exclude-ref", "refs/custom/*"]) == cli.RC_FINDINGS)
+
+        runtime = engine.audit(repo, exclude_refs=("refs/agents/*",))
+        check("--exclude-ref drops runtime code noise",
+              runtime["counts"][engine.ORPHAN_CODE] == EXPECTED[engine.ORPHAN_CODE] - 1)
+        check("a secret that lives only in the excluded namespace survives",
+              runtime["counts"][engine.ORPHAN_SECRET_RISK] == EXPECTED[engine.ORPHAN_SECRET_RISK])
+        check("hidden runtime namespaces are counted even when excluded",
+              runtime["hidden_refs"]["refs/agents/"] == 1)
+
+        opted_out = engine.audit(repo, exclude_refs=("refs/custom/*",), allow_excluded_secrets=True)
+        check("--allow-excluded-secrets drops the excluded secret",
+              opted_out["counts"][engine.ORPHAN_SECRET_RISK] == EXPECTED[engine.ORPHAN_SECRET_RISK] - 1)
+        check("--allow-excluded-secrets is declared, never silent",
+              opted_out["scope"]["excluded secret scan"].startswith("off"))
 
         narrow = engine.audit(repo, include_worktrees=False)
         check("--no-worktrees drops the worktree finding",
@@ -139,7 +165,8 @@ def run() -> int:
 
         rescue_dir = base / "rescue"
         rows = engine.rescue(repo, report, rescue_dir)
-        check("rescue writes code, secret and doc", len(rows) == 4)
+        check("rescue writes code, secret and doc",
+              len(rows) == sum(EXPECTED[kind] for kind in engine.RESCUABLE))
         check("rescue skips moved and residue",
               {row["path"].split("/", 1)[0] for row in rows} == {"ORPHAN_CODE", "ORPHAN_SECRET_RISK", "ORPHAN_DOC"})
         check("rescue verifies every re-hash",
@@ -191,5 +218,8 @@ def run() -> int:
 
     print("SELF-TEST passed: %d checks on a synthetic repository" % len(checks))
     print("fixture classes: %s" % " · ".join("%s=%d" % (kind, EXPECTED[kind]) for kind in engine.CLASSES))
-    print("fixture verdict: RC 1 · rescue 4 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2")
+    print(
+        "fixture verdict: RC 1 · rescue %d files re-hashed · receipt byte-identical · "
+        "clean RC 0 · invalid RC 2" % len(rows)
+    )
     return 0

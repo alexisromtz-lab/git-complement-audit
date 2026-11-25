@@ -1,6 +1,6 @@
 """Contract tests at the CLI boundary: exit codes, receipt determinism and rescue permissions.
 
-The 28 in-process checks of ``--self-test`` cover the engine; these cover what a caller
+The in-process checks of ``--self-test`` cover the engine; these cover what a caller
 actually sees — the process exit code and the files it is allowed to leave behind.
 """
 
@@ -62,7 +62,8 @@ def commit(repo: pathlib.Path, index: pathlib.Path, files: dict[str, str], messa
     return git(repo, *args, env=env).strip()
 
 
-def make_repo(box: pathlib.Path, hidden: dict[str, str] | None = None) -> pathlib.Path:
+def make_repo(box: pathlib.Path, hidden: dict[str, str] | None = None,
+              hidden_ref: str = "refs/custom/hidden") -> pathlib.Path:
     repo = box / ("repo-%d" % len(list(box.iterdir())))
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
@@ -74,7 +75,7 @@ def make_repo(box: pathlib.Path, hidden: dict[str, str] | None = None) -> pathli
     git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
     if hidden:
         side = commit(repo, index, hidden, "hidden", parent=head)
-        git(repo, "update-ref", "refs/custom/hidden", side)
+        git(repo, "update-ref", hidden_ref, side)
     return repo
 
 
@@ -117,13 +118,31 @@ class ContractTest(unittest.TestCase):
         secrets = [f["path"] for f in report["findings"] if f["class"] == "ORPHAN_SECRET_RISK"]
         self.assertEqual(secrets, ["deep/.env"])
 
-    def test_exclude_ref_is_accepted_and_declared(self) -> None:
-        repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n"})
-        excluded = audit(str(repo), "--json", "--exclude-ref", "refs/custom/*")
-        self.assertEqual(excluded.returncode, 0, excluded.stderr)
-        report = json.loads(excluded.stdout)
+    def test_exclude_ref_drops_noise_but_never_a_secret(self) -> None:
+        repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n", "deep/lost.py": "x = 1\n"})
+        done = audit(str(repo), "--json", "--exclude-ref", "refs/custom/*")
+        self.assertEqual(done.returncode, 1, done.stderr)
+        report = json.loads(done.stdout)
         self.assertEqual(report["scope"]["refs excluded"], 1)
+        self.assertEqual(report["scope"]["excluded secret scan"], "on")
+        self.assertEqual(report["counts"]["ORPHAN_CODE"], 0)
+        secrets = [(f["path"], f["root"]) for f in report["findings"]
+                   if f["class"] == "ORPHAN_SECRET_RISK"]
+        self.assertEqual(secrets, [("deep/.env", "excluded refs")])
+
+    def test_allow_excluded_secrets_opts_out_and_declares_it(self) -> None:
+        repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n"})
+        done = audit(str(repo), "--json", "--exclude-ref", "refs/custom/*", "--allow-excluded-secrets")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        report = json.loads(done.stdout)
         self.assertEqual(report["counts"]["ORPHAN_SECRET_RISK"], 0)
+        self.assertEqual(report["scope"]["excluded secret scan"], "off (--allow-excluded-secrets)")
+
+    def test_json_counts_hidden_runtime_namespaces(self) -> None:
+        repo = make_repo(self.box, {"notes/todo.py": "x = 1\n"}, hidden_ref="refs/agents/turn/1")
+        report = json.loads(audit(str(repo), "--json", "--exclude-ref", "refs/agents/*").stdout)
+        self.assertEqual(report["hidden_refs"]["refs/agents/"], 1)
+        self.assertEqual(report["hidden_refs"]["refs/original/"], 0)
 
     def test_invalid_repository_exits_two(self) -> None:
         plain = self.box / "plain"

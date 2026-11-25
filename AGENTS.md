@@ -28,11 +28,16 @@ network client, no plugin system.
    Never quote a measurement taken from a private repository.
 8. **No absolute paths in the report.** `repo` carries a head, an object format and counts;
    never a home-directory path, never a hostname.
+9. **`--exclude-ref` removes noise, never evidence.** Excluding a ref may drop `MOVED`,
+   `ORPHAN_CODE`, `ORPHAN_DOC` and `RESIDUE` from it; `ORPHAN_SECRET_RISK` survives and is
+   labelled with its origin, because a ref an agent wrote by accident is exactly where a
+   committed `.env` hides. Dropping those too requires `--allow-excluded-secrets`, and the
+   report must say the scan was off. A smaller report may never be a quieter one.
 
 ## Verification, before any commit
 
 ```bash
-python -m git_complement_audit --self-test          # 28 in-process checks, RC 0
+python -m git_complement_audit --self-test          # 38 in-process checks, RC 0
 python -m unittest discover -s tests                # CLI contract, RC 0
 ```
 

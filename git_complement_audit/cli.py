@@ -56,7 +56,16 @@ def _parser() -> argparse.ArgumentParser:
         dest="exclude_refs",
         action="append",
         default=[],
-        help="leave out refs matching GLOB, e.g. 'refs/agents/*' (repeatable; declared in scope)",
+        help=(
+            "leave out refs matching GLOB, e.g. 'refs/agents/*' — repeatable; noise is dropped "
+            "but their secret findings are kept and declared in scope"
+        ),
+    )
+    parser.add_argument(
+        "--allow-excluded-secrets",
+        dest="allow_excluded_secrets",
+        action="store_true",
+        help="with --exclude-ref, also drop secret findings from those refs (declared in scope)",
     )
     parser.add_argument("--quiet", action="store_true", help="print nothing unless the contract breaks")
     parser.add_argument("--version", action="version", version="git-complement-audit " + __version__)
@@ -75,6 +84,7 @@ def main(argv=None) -> int:
             include_unreachable=args.unreachable,
             max_tip_listings=args.ref_tips,
             exclude_refs=tuple(args.exclude_refs),
+            allow_excluded_secrets=args.allow_excluded_secrets,
         )
         if args.rescue_dir:
             rows = engine.rescue(args.repo, report, args.rescue_dir)

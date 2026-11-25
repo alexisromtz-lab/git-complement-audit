@@ -68,6 +68,10 @@ SECRET_TOKEN_PREFIXES = (
 SNIFF_BYTES = 65536
 MAX_TIP_LISTINGS = 200
 
+# Namespaces an agent runtime writes on its own. They are counted even when they are
+# excluded, because "clean" must not mean "I stopped looking".
+HIDDEN_NAMESPACES = ("refs/agents/", "refs/checkpoints/", "refs/original/")
+
 _GIT_DROP = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -173,24 +177,38 @@ def _tree_blobs(listing: str) -> dict[str, str]:
     return paths
 
 
-def ref_tips(repo, exclude=()) -> tuple[list[str], list[str]]:
-    """Commit oids of the refs under audit, and those of the refs left out on purpose.
+def _ref_rows(repo) -> list[tuple[str, str, str]]:
+    """Every ref as (name, object type, object id): one census, reused by every counter."""
+    out = git_maybe(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)") or ""
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\0")
+        if len(parts) == 3 and parts[0]:
+            rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def _classify_refs(rows, exclude=()) -> tuple[list[str], list[str], int]:
+    """Tips under audit, tips left out on purpose, and how many refs matched a pattern.
 
     A repository driven by an agent runtime keeps a snapshot ref per turn; those refs
     dominate the complement and hide the operator's own lost work. Excluding them is a
     declared choice, so the excluded tips are returned instead of dropped.
     """
-    out = git_maybe(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)") or ""
-    tips, skipped = set(), set()
-    for line in out.splitlines():
-        parts = line.split("\0")
-        if len(parts) != 3 or parts[1] != "commit" or not parts[2]:
-            continue
-        if any(fnmatch.fnmatchcase(parts[0], pattern) for pattern in exclude):
-            skipped.add(parts[2])
-        else:
-            tips.add(parts[2])
-    return sorted(tips), sorted(skipped)
+    tips, skipped, matched = set(), set(), 0
+    for name, kind, oid in rows:
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude):
+            matched += 1
+            if kind == "commit" and oid:
+                skipped.add(oid)
+        elif kind == "commit" and oid:
+            tips.add(oid)
+    return sorted(tips), sorted(skipped), matched
+
+
+def ref_tips(repo, exclude=()) -> tuple[list[str], list[str]]:
+    tips, skipped, _ = _classify_refs(_ref_rows(repo), exclude)
+    return tips, skipped
 
 
 
@@ -233,6 +251,7 @@ def audit(
     include_unreachable: bool = False,
     max_tip_listings: int = MAX_TIP_LISTINGS,
     exclude_refs=(),
+    allow_excluded_secrets: bool = False,
 ) -> dict:
     """Measure the complement. Writes nothing; every number here is a reading.
 
@@ -256,7 +275,9 @@ def audit(
     worktrees = sorted({sha for sha in worktree_heads(root) if sha})
     extras = [sha for sha in worktrees if sha != head]
 
-    tips, excluded = ref_tips(root, tuple(exclude_refs))
+    rows = _ref_rows(root)
+    tips, excluded, excluded_refs = _classify_refs(rows, tuple(exclude_refs))
+    hidden = {ns: sum(1 for name, _, _ in rows if name.startswith(ns)) for ns in HIDDEN_NAMESPACES}
 
     walk = ["rev-list", "--objects", "--all"]
     skipped = list(excluded) + ([] if include_worktrees else extras)
@@ -289,7 +310,24 @@ def audit(
             kind = ORPHAN_DOC
         else:
             kind = RESIDUE
-        findings.append({"class": kind, "path": path, "oid": oid})
+        findings.append({"class": kind, "path": path, "oid": oid, "root": "refs"})
+
+    excluded_scan = "not requested"
+    if exclude_refs:
+        excluded_scan = "off (--allow-excluded-secrets)" if allow_excluded_secrets else "on"
+    if excluded and excluded_scan == "on":
+        # `--not` would drop every blob shared with the included roots, and a secret shared
+        # with one would disappear; walking the excluded tips alone keeps them visible.
+        listing = git(root, "rev-list", "--objects", "--stdin", input="\n".join(excluded) + "\n")
+        taken = {(f["class"], f["path"], f["oid"]) for f in findings}
+        for path, oid in _blobs(root, listing).items():
+            if path in head_paths or oid in head_oids or not is_secret_path(path):
+                continue
+            if (ORPHAN_SECRET_RISK, path, oid) in taken:
+                continue
+            findings.append(
+                {"class": ORPHAN_SECRET_RISK, "path": path, "oid": oid, "root": "excluded refs"}
+            )
 
     unreachable = 0
     if include_unreachable:
@@ -307,6 +345,7 @@ def audit(
                     "class": ORPHAN_SECRET_RISK if looks_secret(content) else RESIDUE,
                     "path": path,
                     "oid": oid,
+                    "root": "unreachable",
                 }
             )
 
@@ -316,13 +355,13 @@ def audit(
     findings.sort(key=lambda f: (CLASSES.index(f["class"]), f["path"], f["oid"]))
 
     counts = {kind: sum(1 for f in findings if f["class"] == kind) for kind in CLASSES}
-    refs = len((git_maybe(root, "for-each-ref", "--format=%(refname)") or "").splitlines())
+    refs = len(rows)
     outside = git_maybe(
         root, "rev-list", "--count", "--all", *extras, *(["--not", head] if head else [])
     )
     reported_worktrees = len(worktrees) if include_worktrees else 1
     return {
-        "schema": 1,
+        "schema": 2,
         "tool": "git-complement-audit",
         "version": __version__,
         "repo": {
@@ -339,8 +378,12 @@ def audit(
             "ref tips": len(exact_tips),
             "ref tip listing limit": max_tip_listings,
             "unreachable objects": bool(include_unreachable),
-            "refs excluded": len(excluded),
+            "refs excluded": excluded_refs,
+            "ref tips excluded": len(excluded),
+            "exclude-ref patterns": list(exclude_refs),
+            "excluded secret scan": excluded_scan,
         },
+        "hidden_refs": hidden,
         "universe": {
             "paths": len(findings),
             "blobs": len({f["oid"] for f in findings}),
@@ -445,7 +488,8 @@ def receipt(repo, report: dict, path) -> str:
 
 def render(report: dict) -> str:
     repo, universe, counts = report["repo"], report["universe"], report["counts"]
-    included = [key for key, value in report["scope"].items() if value is True]
+    scope = report["scope"]
+    included = [key for key, value in scope.items() if value is True]
     lines = [
         "SCOPE     head=%s object-format=%s refs=%d worktrees=%d commits-outside-head=%d"
         % (
@@ -456,22 +500,41 @@ def render(report: dict) -> str:
             repo["commits_outside_head"],
         ),
         "INCLUDED  %s" % "; ".join(included),
+    ]
+    if scope["exclude-ref patterns"]:
+        lines.append(
+            "EXCLUDED  patterns=%s refs=%d tips=%d secret-scan=%s"
+            % (
+                ", ".join(scope["exclude-ref patterns"]),
+                scope["refs excluded"],
+                scope["ref tips excluded"],
+                scope["excluded secret scan"],
+            )
+        )
+    hidden = ["%s%d" % (namespace, count) for namespace, count in report["hidden_refs"].items() if count]
+    if hidden:
+        lines.append("HIDDEN    runtime namespaces: %s" % " · ".join(hidden))
+    lines += [
         "UNIVERSE  paths-outside-head=%d blobs=%d bytes=%d"
         % (universe["paths"], universe["blobs"], universe["bytes"]),
         "CLASSES   %s" % " · ".join("%s=%d" % (kind, counts[kind]) for kind in CLASSES),
     ]
-    if not report["scope"]["every path of each ref tip"]:
+    if not scope["every path of each ref tip"]:
         lines.append(
             "NOTE      per-tip listing skipped: %d ref tips > limit %d, so MOVED can be "
             "under-reported; re-run with --ref-tips %d"
-            % (
-                report["scope"]["ref tips"],
-                report["scope"]["ref tip listing limit"],
-                2 * report["scope"]["ref tips"],
-            )
+            % (scope["ref tips"], scope["ref tip listing limit"], 2 * scope["ref tips"])
+        )
+    if scope["excluded secret scan"].startswith("off"):
+        lines.append(
+            "NOTE      %d excluded ref tips were not scanned for secrets: --allow-excluded-secrets"
+            % scope["ref tips excluded"]
         )
     for finding in report["findings"]:
-        lines.append("  %-18s %9d B  %s" % (finding["class"], finding["size"], finding["path"]))
+        origin = "" if finding["root"] == "refs" else "  [%s]" % finding["root"]
+        lines.append(
+            "  %-18s %9d B  %s%s" % (finding["class"], finding["size"], finding["path"], origin)
+        )
     failing = [kind for kind in FAILING if counts[kind]]
     if failing:
         total = sum(counts[kind] for kind in failing)
