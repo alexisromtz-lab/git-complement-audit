@@ -168,10 +168,13 @@ out, and it is deliberately narrow:
 - **Nothing is written.** Withdrawing the file restores the finding, byte for byte; the fixture
   checks exactly that.
 
-The tool audits itself this way: six historical copies of `engine.py` and `selfcheck.py`, from
-before the detector learned to assemble its markers at run time, are declared in
-[`.git-complement-audit-ignore`](.git-complement-audit-ignore). `--scan-history` on this
-repository exits 0 with `EXEMPT_SECRET=6`, and every future blob is clean by construction.
+The tool audits itself this way: nine historical copies of `engine.py`, `selfcheck.py` and
+`tests/test_audit.py`, from before the detector learned to assemble its markers at run time,
+are declared in [`.git-complement-audit-ignore`](.git-complement-audit-ignore). Six were
+already outside `HEAD`; the other three were the published v1.3.0 versions, which became
+history the moment v1.3.1 entered it — a cleanup publishes its own predecessor. `--scan-history`
+on this repository exits 0 with `EXEMPT_SECRET=9`, `unused=0`, and every blob created from here
+on is clean by construction.
 
 ## Flags
 
@@ -360,3 +363,11 @@ and that a declared exemption moves a secret out of the gate while leaving orpha
 ## License
 
 MIT.
+
+## Field notes
+
+This repository belongs to an audit corpus whose measurements are published as
+field notes. Two of them come from the same work:
+
+- [El bug que responde SUCCESS: auditoría reproducible de litellm#46923](https://dev.to/alexisromtz7/el-bug-que-responde-success-auditoria-reproducible-de-litellm46923-ad6)
+- [The bug that answers SUCCESS: a reproducible audit of litellm#46923](https://dev.to/alexisromtz7/the-bug-that-answers-success-a-reproducible-audit-of-litellm46923-15lk)
