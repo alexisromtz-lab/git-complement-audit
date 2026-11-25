@@ -50,6 +50,14 @@ def _parser() -> argparse.ArgumentParser:
         default=engine.MAX_TIP_LISTINGS,
         help="list every path of each ref tip while tips <= N (default: %d)" % engine.MAX_TIP_LISTINGS,
     )
+    parser.add_argument(
+        "--exclude-ref",
+        metavar="GLOB",
+        dest="exclude_refs",
+        action="append",
+        default=[],
+        help="leave out refs matching GLOB, e.g. 'refs/agents/*' (repeatable; declared in scope)",
+    )
     parser.add_argument("--quiet", action="store_true", help="print nothing unless the contract breaks")
     parser.add_argument("--version", action="version", version="git-complement-audit " + __version__)
     parser.add_argument("--self-test", action="store_true", help="run the synthetic fixture audit and exit")
@@ -66,6 +74,7 @@ def main(argv=None) -> int:
             include_worktrees=args.worktrees,
             include_unreachable=args.unreachable,
             max_tip_listings=args.ref_tips,
+            exclude_refs=tuple(args.exclude_refs),
         )
         if args.rescue_dir:
             rows = engine.rescue(args.repo, report, args.rescue_dir)

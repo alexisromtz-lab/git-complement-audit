@@ -116,6 +116,14 @@ def run() -> int:
         check("verdict fails on orphan code", engine.has_failure(report))
         check("cli returns 1 on orphan code", cli.main([str(repo), "--quiet"]) == cli.RC_FINDINGS)
 
+        excluded = engine.audit(repo, exclude_refs=("refs/custom/*",))
+        check("--exclude-ref drops the excluded ref's findings",
+              excluded["counts"][engine.MOVED] == 0 and excluded["counts"][engine.ORPHAN_DOC] == 0)
+        check("--exclude-ref declares how many refs it left out",
+              excluded["scope"]["refs excluded"] == 1)
+        check("--exclude-ref keeps what the other roots still hold",
+              excluded["counts"][engine.ORPHAN_CODE] == 1)
+
         narrow = engine.audit(repo, include_worktrees=False)
         check("--no-worktrees drops the worktree finding",
               narrow["counts"][engine.ORPHAN_CODE] == EXPECTED[engine.ORPHAN_CODE] - 1)

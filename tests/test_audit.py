@@ -117,6 +117,14 @@ class ContractTest(unittest.TestCase):
         secrets = [f["path"] for f in report["findings"] if f["class"] == "ORPHAN_SECRET_RISK"]
         self.assertEqual(secrets, ["deep/.env"])
 
+    def test_exclude_ref_is_accepted_and_declared(self) -> None:
+        repo = make_repo(self.box, {"deep/.env": "TOKEN=1\n"})
+        excluded = audit(str(repo), "--json", "--exclude-ref", "refs/custom/*")
+        self.assertEqual(excluded.returncode, 0, excluded.stderr)
+        report = json.loads(excluded.stdout)
+        self.assertEqual(report["scope"]["refs excluded"], 1)
+        self.assertEqual(report["counts"]["ORPHAN_SECRET_RISK"], 0)
+
     def test_invalid_repository_exits_two(self) -> None:
         plain = self.box / "plain"
         plain.mkdir()

@@ -8,6 +8,7 @@ missing file.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -172,15 +173,24 @@ def _tree_blobs(listing: str) -> dict[str, str]:
     return paths
 
 
-def ref_tips(repo) -> list[str]:
-    """Commit oids behind every ref, sorted and deduplicated."""
+def ref_tips(repo, exclude=()) -> tuple[list[str], list[str]]:
+    """Commit oids of the refs under audit, and those of the refs left out on purpose.
+
+    A repository driven by an agent runtime keeps a snapshot ref per turn; those refs
+    dominate the complement and hide the operator's own lost work. Excluding them is a
+    declared choice, so the excluded tips are returned instead of dropped.
+    """
     out = git_maybe(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)") or ""
-    tips = set()
+    tips, skipped = set(), set()
     for line in out.splitlines():
         parts = line.split("\0")
-        if len(parts) == 3 and parts[1] == "commit" and parts[2]:
+        if len(parts) != 3 or parts[1] != "commit" or not parts[2]:
+            continue
+        if any(fnmatch.fnmatchcase(parts[0], pattern) for pattern in exclude):
+            skipped.add(parts[2])
+        else:
             tips.add(parts[2])
-    return sorted(tips)
+    return sorted(tips), sorted(skipped)
 
 
 
@@ -222,6 +232,7 @@ def audit(
     include_worktrees: bool = True,
     include_unreachable: bool = False,
     max_tip_listings: int = MAX_TIP_LISTINGS,
+    exclude_refs=(),
 ) -> dict:
     """Measure the complement. Writes nothing; every number here is a reading.
 
@@ -245,12 +256,15 @@ def audit(
     worktrees = sorted({sha for sha in worktree_heads(root) if sha})
     extras = [sha for sha in worktrees if sha != head]
 
+    tips, excluded = ref_tips(root, tuple(exclude_refs))
+
     walk = ["rev-list", "--objects", "--all"]
-    if extras and not include_worktrees:
-        walk += ["--not", *extras]
+    skipped = list(excluded) + ([] if include_worktrees else extras)
+    if skipped:
+        walk += ["--not", *sorted(set(skipped))]
     complement = _blobs(root, git(root, *walk))
 
-    tips = ref_tips(root) + (extras if include_worktrees else [])
+    tips += extras if include_worktrees else []
     exact_tips = sorted(set(tips))
     listed_exactly = len(exact_tips) <= max_tip_listings
     if listed_exactly:
@@ -325,6 +339,7 @@ def audit(
             "ref tips": len(exact_tips),
             "ref tip listing limit": max_tip_listings,
             "unreachable objects": bool(include_unreachable),
+            "refs excluded": len(excluded),
         },
         "universe": {
             "paths": len(findings),

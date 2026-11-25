@@ -74,6 +74,32 @@ The tool therefore merges two readings: the full object walk (whole history, one
 distinct blob) and one `ls-tree -r` per ref tip (every path, exactly). Every number in the
 report comes from one of them, and the `INCLUDED` line says which ones ran.
 
+## Flags
+
+| flag | effect |
+|---|---|
+| `--json` | machine-readable report on stdout |
+| `--rescue-dir PATH` | copy rescuable blobs outside the object database (see [Rescue](#rescue)) |
+| `--receipt PATH` | write the deterministic pre-GC receipt (see [Receipt](#receipt-before-you-delete-anything)) |
+| `--unreachable` | also scan objects no ref reaches — dropped stashes, dangling blobs |
+| `--exclude-ref GLOB` | leave out refs matching a glob, repeatable, always declared in `scope` |
+| `--ref-tips N` | list every path of each ref tip while tips ≤ N (default 200) |
+| `--no-worktrees` | ignore detached worktree HEADs |
+| `--quiet` | print nothing unless the contract breaks |
+| `--self-test` | build the fixture and verify the instrument |
+
+### Repositories driven by an agent runtime
+
+Copilot, Claude Code and Cursor record a snapshot ref per turn (`refs/agents/…`). Those refs
+dominate the complement: the audit reports the runtime's own snapshots as loudly as the work
+you actually lost. Exclude them to see only what you can lose:
+
+```bash
+git-complement-audit . --exclude-ref 'refs/agents/*'
+```
+
+`scope` then carries `refs excluded`, so a smaller report never pretends to be a empty one.
+
 ## Declared scope
 
 The report never claims more than it measured:
@@ -139,7 +165,7 @@ Builds a throwaway repository in a temporary directory — two refs, a detached 
 file per class, one dangling secret — audits it, rescues it, and checks the result:
 
 ```
-SELF-TEST passed: 28 checks on a synthetic repository
+SELF-TEST passed: 31 checks on a synthetic repository
 fixture classes: MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=1 · ORPHAN_DOC=1 · RESIDUE=1
 fixture verdict: RC 1 · rescue 4 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2
 ```
