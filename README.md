@@ -13,10 +13,16 @@ Zero dependencies. Python 3.11+. Reads only; writes nothing except the files you
 ## Install
 
 ```bash
-uvx git-complement-audit .          # one shot, no install
-pipx install git-complement-audit   # or keep it around
-pip install git-complement-audit
+# one shot, nothing installed
+uvx --from git+https://github.com/alexisromtz-lab/git-complement-audit git-complement-audit .
+
+# or keep it around
+pipx install git+https://github.com/alexisromtz-lab/git-complement-audit
+pip install git+https://github.com/alexisromtz-lab/git-complement-audit
 ```
+
+Not on PyPI yet. The package builds from source with `setuptools` and no runtime
+dependencies, so `pip install .` inside a clone works too.
 
 ## Sample output
 
@@ -108,7 +114,7 @@ declared scope, the counts per class, and the SHA-256 of every blob that was out
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }        # 0, or refs outside HEAD are invisible
-- run: pipx run git-complement-audit .
+- run: pipx run --spec git+https://github.com/alexisromtz-lab/git-complement-audit git-complement-audit .
 ```
 
 `fetch-depth: 0` matters: a shallow clone has no complement, so the audit would pass by
