@@ -9,12 +9,15 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+
+from git_complement_audit import __version__
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATE = "2026-01-01T00:00:00 +0000"
@@ -272,6 +275,38 @@ class ContractTest(unittest.TestCase):
             if path.is_file():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, path)
         self.assertEqual(len((out / "SHA256SUMS").read_text().splitlines()), 2)
+
+
+class CitableIdentity(unittest.TestCase):
+    """The citation surface is a claim about one version; this reader keeps it true.
+
+    A `CITATION.cff` that names a version the package no longer declares points at an
+    object that does not exist, and nothing fails -- the citation is simply wrong, and
+    the wrongness only shows up in somebody else's bibliography. These files move
+    together, or this suite says they did not.
+    """
+
+    def _cff_scalar(self, key: str) -> str:
+        text = (ROOT / "CITATION.cff").read_text(encoding="utf-8")
+        match = re.search(r"^%s:\s*(.+?)\s*$" % re.escape(key), text, re.MULTILINE)
+        self.assertIsNotNone(match, "CITATION.cff has no `%s:`" % key)
+        return match.group(1).strip().strip('"')
+
+    def _zenodo(self) -> dict:
+        return json.loads((ROOT / ".zenodo.json").read_text(encoding="utf-8"))
+
+    def test_the_citation_names_the_declared_version(self) -> None:
+        self.assertEqual(self._cff_scalar("version"), __version__)
+        self.assertEqual(self._zenodo()["version"], __version__)
+
+    def test_the_two_citation_surfaces_agree_on_the_title(self) -> None:
+        self.assertEqual(self._cff_scalar("title"), self._zenodo()["title"])
+
+    def test_both_surfaces_point_at_the_same_repository(self) -> None:
+        self.assertEqual(
+            self._cff_scalar("repository-code"),
+            self._zenodo()["related_identifiers"][0]["identifier"],
+        )
 
 
 if __name__ == "__main__":

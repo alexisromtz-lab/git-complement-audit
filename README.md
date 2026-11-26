@@ -342,10 +342,17 @@ As a `pre-commit` hook, add to `.pre-commit-config.yaml`:
 
 ```yaml
 - repo: https://github.com/alexisromtz-lab/git-complement-audit
-  rev: v1.4.0
+  rev: v1.5.0
   hooks:
     - id: git-complement-audit
 ```
+
+## Citing this
+
+`CITATION.cff` and `.zenodo.json` travel in the repository and inside the built
+distribution, and both name the version they describe. Cite the version you ran, not the
+idea: a report produced by 1.5.0 and a report produced by an older tag are different
+instruments with the same name.
 
 ## Verify the instrument
 

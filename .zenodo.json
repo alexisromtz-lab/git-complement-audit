@@ -1,0 +1,31 @@
+{
+  "title": "git-complement-audit: auditing every path Git keeps outside HEAD",
+  "description": "<p>Zero-dependency CLI that measures what a Git repository keeps outside HEAD -- unmerged commits behind hidden refs, detached worktrees nobody adopted, paths a reset dropped, blobs no ref can name -- classifies every path in that complement, and says whether anything in it is worth saving before 'git worktree prune' or 'git gc --prune' destroys it. The audit reads: it writes no file and mutates no ref, and the only writes are the opt-in --receipt and --rescue-dir a caller asks for. Exit codes are a contract (0 clean, 1 orphaned code or secret risk, 2 invalid repository or arguments), and every pass that is skipped is declared in the report, so a clean verdict never covers bytes the instrument did not look at.</p>",
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "version": "1.5.0",
+  "publication_date": "2026-11-26",
+  "creators": [
+    {
+      "name": "Román Martínez, José Alexis",
+      "orcid": "0009-0001-9116-075X"
+    }
+  ],
+  "keywords": [
+    "git",
+    "orphans",
+    "worktree",
+    "secrets",
+    "forensics",
+    "cli"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/alexisromtz-lab/git-complement-audit",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ],
+  "notes": "Deposited from https://github.com/alexisromtz-lab/git-complement-audit at tag v1.5.0."
+}
