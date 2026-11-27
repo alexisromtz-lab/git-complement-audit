@@ -417,3 +417,7 @@ field notes. Two of them come from the same work:
 
 - [El bug que responde SUCCESS: auditoría reproducible de litellm#46923](https://dev.to/alexisromtz7/el-bug-que-responde-success-auditoria-reproducible-de-litellm46923-ad6)
 - [The bug that answers SUCCESS: a reproducible audit of litellm#46923](https://dev.to/alexisromtz7/the-bug-that-answers-success-a-reproducible-audit-of-litellm46923-15lk)
+
+The instrument has also been run against repositories it does not own, with the prediction
+written before the first clone: [EXTERNAL_BASELINE.md](EXTERNAL_BASELINE.md). It is the only
+place in this repository where a number does not come from `--self-test`, and it declares why.
