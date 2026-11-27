@@ -70,7 +70,13 @@ object database is fully read in every case; no report below is a report about i
 **P2 — refuted, and refuted in the direction that matters.** All five measured repositories hold
 orphaned code: 504 paths between them, one hundred per repository on average. The claim was that
 the complement is a rarity in healthy popular projects. It is not. `git status` on any of these
-five prints a clean tree while between 33 and 254 source paths sit unreachable from `HEAD`.
+five prints a clean tree while between 33 and 254 source paths sit outside `HEAD`.
+
+Every one of the 1 015 rows in this population carries `root: refs`, except the four history
+claims, which carry `root: history`. Not one carries `root: unreachable`, and `uncovered_blobs`
+is zero in all five — so in no measured repository is a blob reachable from no ref at all. The
+work these rows name is on a named branch that is not the default one. What is missing is a
+merge, never a ref: this measurement is about unmerged work, and it is evidence of no loss.
 
 **P3 — confirmed.** `psf/requests` carries four `HISTORY_SECRET_RISK` blobs. One repository was
 enough to settle the claim, and it is the one whose history is longest.
@@ -97,6 +103,9 @@ doing what it promises — naming what a human must look at, not deciding for th
   base rate, not a census.
 - `ORPHAN_CODE` counts paths, not intent: an abandoned branch and an unmerged worktree commit
   are indistinguishable to a reader of the object database, and both are worth naming.
+- The word *unreachable* is reserved in this repository for a blob that no ref reaches. A path
+  outside `HEAD` is not that, and reading the two as one claim turns a merge backlog into a
+  data-loss alarm, which is the one thing this instrument must never do.
 - No claim is made that any of these repositories has lost something its maintainers wanted.
 
 ## Reproduction
