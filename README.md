@@ -354,6 +354,9 @@ distribution, and both name the version they describe. Cite the version you ran,
 idea: a report produced by 1.5.0 and a report produced by an older tag are different
 instruments with the same name.
 
+The 1.5.0 deposit is archived at Zenodo as `10.5281/zenodo.24575076`; `CITATION.cff`
+carries the same identifier, and `tests/test_audit.py` fails if the two surfaces disagree.
+
 ## Verify the instrument
 
 ```bash

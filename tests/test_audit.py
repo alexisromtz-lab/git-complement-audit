@@ -308,6 +308,14 @@ class CitableIdentity(unittest.TestCase):
             self._zenodo()["related_identifiers"][0]["identifier"],
         )
 
+    def test_the_minted_doi_is_named_on_both_surfaces(self) -> None:
+        """The DOI of a version is fixed at deposit; a stale one silently cites a sibling version."""
+        doi = self._cff_scalar("doi")
+        self.assertRegex(doi, r"^10\.5281/zenodo\.\d+$")
+        named = set(re.findall(r"10\.5281/zenodo\.\d+",
+                               (ROOT / "README.md").read_text(encoding="utf-8")))
+        self.assertEqual(named, {doi}, "README names a DOI the citation does not")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ authors:
 type: software
 license: MIT
 repository-code: "https://github.com/alexisromtz-lab/git-complement-audit"
+doi: "10.5281/zenodo.24575076"
 version: "1.5.0"
 date-released: "2026-11-26"
 keywords:
