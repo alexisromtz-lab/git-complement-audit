@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sys
 
@@ -13,6 +14,32 @@ from .selfcheck import run as run_self_test
 RC_CLEAN = 0
 RC_FINDINGS = 1
 RC_CONTRACT = 2
+
+
+def _as_of(text: str) -> int:
+    """Reference date for the age strata: unix seconds, YYYY-MM-DD or ISO 8601.
+
+    A date without a zone is read as UTC, not as local time: the strata must not change
+    with the timezone of whoever runs the audit.
+    """
+    value = (text or "").strip()
+    if value.isdigit():
+        return int(value)
+    moment = None
+    try:
+        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            moment = datetime.datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            moment = None
+    if moment is None:
+        raise argparse.ArgumentTypeError(
+            "expected unix seconds, YYYY-MM-DD or ISO 8601, got %r" % text
+        )
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return int(moment.timestamp())
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -85,6 +112,16 @@ def _parser() -> argparse.ArgumentParser:
             "(default: .git-complement-audit-ignore at the repository root, if present)"
         ),
     )
+    parser.add_argument(
+        "--as-of",
+        metavar="DATE",
+        dest="as_of",
+        type=_as_of,
+        help=(
+            "date the age strata against DATE (unix seconds, YYYY-MM-DD or ISO 8601); "
+            "default: the committer date of HEAD, so two runs over one tree agree"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="print nothing unless the contract breaks")
     parser.add_argument("--version", action="version", version="git-complement-audit " + __version__)
     parser.add_argument("--self-test", action="store_true", help="run the synthetic fixture audit and exit")
@@ -105,6 +142,7 @@ def main(argv=None) -> int:
             allow_excluded_secrets=args.allow_excluded_secrets,
             scan_history=args.scan_history,
             ignore_file=args.ignore_file,
+            as_of=args.as_of,
         )
         if args.rescue_dir:
             rows = engine.rescue(args.repo, report, args.rescue_dir)

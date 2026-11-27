@@ -16,6 +16,11 @@ import tempfile
 from . import engine
 
 FIXTURE_DATE = "2026-01-01T00:00:00 +0000"
+# The three refs are dated a stratum apart, so the fixture exercises all three buckets from
+# one run: the detached worktree lands live (0 d), the runtime ref recent (47 d) and the
+# hidden ref stale (103 d).
+SIDE_DATE = "2025-09-20T00:00:00 +0000"
+AGENT_DATE = "2025-11-15T00:00:00 +0000"
 
 BASE_FILES = {
     "app.py": "print('hello')\n",
@@ -53,12 +58,12 @@ UNNAMED = 1
 
 
 def _commit(repo: pathlib.Path, files: dict[str, str], message: str, parent: str | None = None,
-            index: pathlib.Path | None = None) -> str:
+            index: pathlib.Path | None = None, date: str = FIXTURE_DATE) -> str:
     index = index or repo / ".git" / "self-test.index"
     env = {
         "GIT_INDEX_FILE": str(index),
-        "GIT_AUTHOR_DATE": FIXTURE_DATE,
-        "GIT_COMMITTER_DATE": FIXTURE_DATE,
+        "GIT_AUTHOR_DATE": date,
+        "GIT_COMMITTER_DATE": date,
     }
     engine.git(repo, "read-tree", "--empty", env=env)
     for path, content in sorted(files.items()):
@@ -98,10 +103,10 @@ def run() -> int:
         repo = base / "repo"
         head = _init(repo)
 
-        side = _commit(repo, SIDE_FILES, "hidden ref work", parent=head)
+        side = _commit(repo, SIDE_FILES, "hidden ref work", parent=head, date=SIDE_DATE)
         engine.git(repo, "update-ref", "refs/custom/hidden", side)
 
-        agent = _commit(repo, AGENT_FILES, "runtime checkpoint", parent=head)
+        agent = _commit(repo, AGENT_FILES, "runtime checkpoint", parent=head, date=AGENT_DATE)
         engine.git(repo, "update-ref", "refs/agents/turn/1", agent)
 
         worktree = base / "wt"
@@ -110,7 +115,16 @@ def run() -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("def todo():\n    return None\n", encoding="utf-8")
         engine.git(worktree, "add", WORKTREE_FILE)
-        engine.git(worktree, "commit", "-q", "-m", "detached work")
+        # Dated like HEAD on purpose: an undated commit would be stamped with the wall clock,
+        # and the fixture would then report a different stratum on every run.
+        engine.git(
+            worktree,
+            "commit",
+            "-q",
+            "-m",
+            "detached work",
+            env={"GIT_AUTHOR_DATE": FIXTURE_DATE, "GIT_COMMITTER_DATE": FIXTURE_DATE},
+        )
 
         report = engine.audit(repo)
         check("head is the fixture commit", report["repo"]["head"] == head)
@@ -131,11 +145,56 @@ def run() -> int:
         check("verdict fails on orphan code", engine.has_failure(report))
         check("cli returns 1 on orphan code", cli.main([str(repo), "--quiet"]) == cli.RC_FINDINGS)
 
+        strata = report["age_strata"]
+        check("age strata are dated against the HEAD commit, not the wall clock",
+              strata["state"] == "MEASURED" and strata["as_of_source"] == "HEAD committer date")
+        check("age strata put one bucket per ref, one ref per bucket",
+              (strata["live"], strata["recent"], strata["stale"]) == (1, 2, 5))
+        check("age strata date a moved path by the branch that holds it, not by HEAD",
+              strata["live"] == 1)
+        check("age strata account for every ref row",
+              strata["conservation"]
+              and strata["live"] + strata["recent"] + strata["stale"] + strata["history_only"]
+              == strata["rows"] == 8)
+        check("age strata partitions the ref rows and only those",
+              strata["rows"] == sum(1 for f in report["findings"] if f["root"] == "refs"))
+        check("every fixture ref carries a committer date", strata["undated_refs"] == [])
+        check("the render publishes the strata it measured",
+              "STRATA    as-of=1767225600 (HEAD committer date) live<=30d=1 · recent31-90d=2 · "
+              "stale>90d=5 · history-only=0 of 8 ref row(s)" in engine.render(report))
+        census = strata["refs"]
+        check("the ref census partitions the repository's own refs",
+              (census["live"], census["recent"], census["stale"]) == (1, 1, 1)
+              and census["conservation"]
+              and census["total"] == report["repo"]["refs"])
+        check("the ref census counts refs, not worktree HEADs",
+              census["total"] == 3 and report["repo"]["worktrees"] == 2)
+        check("the render publishes the ref census it measured",
+              "REFS      live<=30d=1 · recent31-90d=1 · stale>90d=1 of 3 ref(s)"
+              in engine.render(report))
+        shifted = engine.audit(repo, as_of=cli._as_of("2025-10-01"))
+        check("--as-of moves the buckets without moving the rows",
+              shifted["age_strata"]["live"] == 8
+              and shifted["age_strata"]["rows"] == strata["rows"])
+        check("a tip dated after the reference is counted live, and declared",
+              shifted["age_strata"]["future_dated_rows"] == 3)
+        check("--as-of moves the ref census as well as the rows",
+              shifted["age_strata"]["refs"]["live"] == 3
+              and shifted["age_strata"]["refs"]["total"] == census["total"])
+        check("--as-of is a reference, not a gate",
+              cli.main([str(repo), "--quiet", "--as-of", "2025-10-01"]) == cli.RC_FINDINGS)
+        skipped_tips = engine.audit(repo, max_tip_listings=1)
+        check("strata declare NO_MEDIDO when the tip listing is skipped",
+              skipped_tips["age_strata"]["state"] == "NO_MEDIDO")
+
         excluded = engine.audit(repo, exclude_refs=("refs/custom/*",))
         check("--exclude-ref drops the excluded ref's findings",
               excluded["counts"][engine.MOVED] == 0 and excluded["counts"][engine.ORPHAN_DOC] == 0)
         check("--exclude-ref declares how many refs it left out",
               excluded["scope"]["refs excluded"] == 1)
+        check("--exclude-ref shrinks the ref census by exactly the refs it named",
+              excluded["age_strata"]["refs"]["total"] + excluded["scope"]["refs excluded"]
+              == excluded["repo"]["refs"])
         check("--exclude-ref keeps what the other roots still hold",
               excluded["counts"][engine.ORPHAN_CODE] == EXPECTED[engine.ORPHAN_CODE] - 1)
         check("--exclude-ref keeps the secret it excluded, and names its root", any(
@@ -311,6 +370,8 @@ def run() -> int:
         check("receipt is deterministic", first.read_bytes() == second.read_bytes())
         check("receipt carries a sha256 per finding",
               all("sha256" in finding for finding in json.loads(first.read_text(encoding="utf-8"))["findings"]))
+        check("the receipt carries the strata it was signed with",
+              json.loads(first.read_text(encoding="utf-8"))["age_strata"]["live"] == 1)
 
         clean = base / "clean"
         _init(clean)
@@ -354,6 +415,22 @@ def run() -> int:
             wide["closure"]["covered_blobs"],
             wide["closure"]["uncovered_blobs"],
         )
+    )
+    print(
+        "fixture strata: live<=30d=%d · recent31-90d=%d · stale>90d=%d · history-only=%d "
+        "of %d ref rows, as-of HEAD %d"
+        % (
+            strata["live"],
+            strata["recent"],
+            strata["stale"],
+            strata["history_only"],
+            strata["rows"],
+            strata["as_of"],
+        )
+    )
+    print(
+        "fixture refs: live<=30d=%d · recent31-90d=%d · stale>90d=%d of %d ref(s)"
+        % (census["live"], census["recent"], census["stale"], census["total"])
     )
     print(
         "fixture verdict: RC 1 · rescue %d files re-hashed · receipt byte-identical · "

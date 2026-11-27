@@ -40,6 +40,8 @@ UNIVERSE  paths-outside-head=8 blobs=8 bytes=167
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=off
 CLOSURE   odb-blobs=11 = head=3 + complement=8 + uncovered=0
 CLASSES   MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
+STRATA    as-of=1767225600 (HEAD committer date) live<=30d=1 · recent31-90d=2 · stale>90d=5 · history-only=0 of 8 ref row(s)
+REFS      live<=30d=1 · recent31-90d=1 · stale>90d=1 of 3 ref(s)
 NOTE      1 blob(s) outside HEAD are named by no path row — their path is still in HEAD, or another blob took it — so their contents were not read; a credential there survives in every clone; --scan-history reads them
   MOVED                     15 B  app_copy.py
   ORPHAN_CODE               27 B  orphan/handler.py
@@ -218,6 +220,7 @@ on is clean by construction.
 | `--allow-excluded-secrets` | with `--exclude-ref`, also drop secrets from those refs (declared in `scope`) |
 | `--ignore-file PATH` | exemption file of declared blob ids (default: `.git-complement-audit-ignore` at the repository root, if present) — see [Exemptions](#exemptions-by-content-address) |
 | `--ref-tips N` | list every path of each ref tip while tips ≤ N (default 200) |
+| `--as-of DATE` | date the age strata against `DATE` — unix seconds, `YYYY-MM-DD` or ISO 8601; default: the committer date of `HEAD` (see [Age strata](#age-strata)) |
 | `--no-worktrees` | ignore detached worktree HEADs |
 | `--quiet` | print nothing unless the contract breaks |
 | `--self-test` | build the fixture and verify the instrument |
@@ -243,6 +246,8 @@ HIDDEN    runtime namespaces: refs/agents/1
 HISTORY   blobs-outside-head=8 named=7 unnamed=1 scan=off
 CLOSURE   odb-blobs=11 = head=3 + complement=8 + uncovered=0
 CLASSES   MOVED=1 · ORPHAN_CODE=2 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
+STRATA    as-of=1767225600 (HEAD committer date) live<=30d=1 · recent31-90d=0 · stale>90d=5 · history-only=0 of 6 ref row(s)
+REFS      live<=30d=1 · recent31-90d=0 · stale>90d=1 of 2 ref(s)
   MOVED                     15 B  app_copy.py
   ORPHAN_CODE               27 B  orphan/handler.py
   ORPHAN_CODE               28 B  scratch/agent_notes.py
@@ -298,6 +303,50 @@ The report never claims more than it measured:
   name it under its twin path.
 - `--unreachable` adds a `git fsck` pass for objects no ref reaches at all (dropped stashes,
   dangling blobs). It is off by default because it is the slowest pass.
+- `STRATA` dates the ref rows against one declared reference and states the partition; when
+  the per-tip listing was skipped it reads `NO_MEDIDO` instead of a zero — see
+  [Age strata](#age-strata).
+- `REFS` publishes the ref census that `SCOPE` counts: every ref the run kept, in the same three
+  windows. It is a partition of the refs, not of the rows, so it shrinks by exactly the refs
+  `--exclude-ref` named.
+
+## Age strata
+
+A raw count of the complement mixes two populations a reviewer treats differently: work that
+moved last week on a branch nobody merged, and a ref left behind in 2021. `STRATA` partitions
+the rows outside `HEAD` by the age of the newest ref tip that still holds them:
+
+```
+STRATA    as-of=1767225600 (HEAD committer date) live<=30d=1 · recent31-90d=2 · stale>90d=5 · history-only=0 of 8 ref row(s)
+REFS      live<=30d=1 · recent31-90d=1 · stale>90d=1 of 3 ref(s)
+```
+
+- **The reference is a commit date, not the clock.** By default it is the committer date of
+  `HEAD`, so two runs over the same tree agree byte for byte on any machine on any day;
+  `--as-of` dates a historical snapshot instead. A tip newer than the reference is counted
+  live and declared on a `NOTE` line — skew is a fact about the reference, never a fourth
+  bucket and never a silent negative age.
+- **It dates presence, not freshness.** A row's age is that of the newest tip whose tree holds
+  *that path with that content*. A file untouched for years inside a branch moved yesterday is
+  live work; a path whose content already sits in `HEAD` under another name is still dated by
+  the branch that lost it, which is why `MOVED` rows do not quietly become live.
+- **The buckets are a partition, and it is published.** `live + recent + stale + history_only`
+  equals `rows`, where `rows` is exactly the findings whose `root` is `refs`. Rows reached only
+  by an excluded ref, by `--scan-history` or by `--unreachable` carry a different `root` and are
+  not dated here: the strata measure the complement, not the run.
+- **`history-only` is named, not folded.** A row that no tip tree holds survives only in commits
+  the branches have moved past: no branch carries it any more. Calling that `stale` would
+  describe an old branch that does not exist.
+- **No tip tree, no strata.** When more than `--ref-tips N` tips exist the per-tip listing is
+  skipped, and the block reads `state: "NO_MEDIDO"` with the reason. An empty bucket is a
+  measurement; a missing measurement is not an empty bucket.
+- **`REFS` answers the question `STRATA` cannot.** The rows say how much of the complement each
+  window holds; the census says how many refs moved in each window, whatever their paths are. The
+  three-bucket identity `live + recent + stale == total` is exact there, because every ref carries
+  one tip date. Worktree HEADs date rows but are not refs, so they stay out of the census: it adds
+  up against the `refs=` count on the `SCOPE` line, minus the refs `--exclude-ref` left out.
+- **`--as-of` changes no verdict.** It moves buckets only: exit codes, findings and the receipt
+  of the same tree stay identical, and the block is signed into the receipt like the rest.
 
 ## Rescue
 
@@ -363,19 +412,22 @@ carries the same identifier, and `tests/test_audit.py` fails if the two surfaces
 git-complement-audit --self-test
 ```
 
-Builds a throwaway repository in a temporary directory — three refs, a detached worktree, one
-file per class, a secret inside a runtime ref, a secret at a path that still exists in `HEAD`,
-one dangling secret — audits it every way the flags allow, declares an exemption and withdraws
-it, rescues it, and checks the result:
+Builds a throwaway repository in a temporary directory — three refs, one stratum apart, a
+detached worktree, one file per class, a secret inside a runtime ref, a secret at a path that
+still exists in `HEAD`, one dangling secret — audits it every way the flags allow, declares an
+exemption and withdraws it, rescues it, and checks the result:
 
 ```
-SELF-TEST passed: 72 checks on a synthetic repository
+SELF-TEST passed: 89 checks on a synthetic repository
 fixture classes: MOVED=1 · ORPHAN_CODE=3 · ORPHAN_SECRET_RISK=2 · ORPHAN_DOC=1 · RESIDUE=1 · HISTORY_SECRET_RISK=0 · EXEMPT_SECRET=0
 fixture closure: odb-blobs=12 = head=3 + complement=9 + uncovered=0
+fixture strata: live<=30d=1 · recent31-90d=2 · stale>90d=5 · history-only=0 of 8 ref rows, as-of HEAD 1767225600
+fixture refs: live<=30d=1 · recent31-90d=1 · stale>90d=1 of 3 ref(s)
 fixture verdict: RC 1 · rescue 6 files re-hashed · receipt byte-identical · clean RC 0 · invalid RC 2
 ```
 
-The fixture uses fixed commit dates, so its `HEAD` is `23831f083fa6…` on any machine. If the
+The fixture uses fixed commit dates, so its `HEAD` is `23831f083fa6…` on any machine, and its
+three refs land one per age stratum — live, recent and stale — on every run. If the
 numbers above stop matching, the engine changed — not the environment.
 
 `python -m unittest discover -s tests` adds the boundary contract: exit codes, receipt
@@ -401,6 +453,9 @@ and that a declared exemption moves a secret out of the gate while leaving orpha
   on the page with the class it replaced.
 - Without `--scan-history` the unnamed blobs are counted but not read. That is a declared
   skip, printed on every run where it happens; it is not a zero.
+- The age strata date a row by the tip trees, so they need the per-tip listing: past
+  `--ref-tips N` tips the block reads `NO_MEDIDO` rather than dating a row by a walk that
+  cannot say which branch holds it.
 - A secret at a path that *is* outside `HEAD` but does not look like one (`config.py` with a
   key inside) is classified `ORPHAN_CODE` by its path. `--scan-history` does not cover it,
   because its path is a name the report can publish.

@@ -62,6 +62,55 @@ closes exactly.
 
 Scan cost was 2 to 10 seconds per repository, on the same machine, with no network access.
 
+## Age strata, measured on the same population
+
+`age_strata` splits the rows by the age of the newest ref tip that still holds them, against a
+reference that is a commit date — the committer date of the audited `HEAD` — so a second run over
+the same clone cannot disagree with the first. Two partitions are published, and they are
+partitions of different populations: the rows, and the repository's own refs.
+
+| repository | as-of (HEAD) | rows | live ≤ 30 d | recent 31–90 d | stale > 90 d | history-only | refs | refs live | refs recent | refs stale |
+|---|---|---|---|---|---|---|---|---|---|---|
+| aw-core | 2026-11-25 | 52 | 0 | 0 | 16 | 36 | 46 | 3 | 15 | 28 |
+| click | 2026-11-16 | 142 | 0 | 0 | 56 | 86 | 77 | 5 | 1 | 71 |
+| requests | 2026-10-26 | 330 | 0 | 0 | 173 | 157 | 172 | 5 | 0 | 167 |
+| attrs | 2026-11-25 | 311 | 8 | 0 | 28 | 275 | 48 | 3 | 0 | 45 |
+| commander.js | 2026-11-07 | 176 | 0 | 0 | 90 | 86 | 137 | 5 | 1 | 131 |
+| **total** | — | **1011** | **8** | **0** | **363** | **640** | **480** | **21** | **17** | **442** |
+
+Both laws close on their own population: 8 + 0 + 363 + 640 = 1011 rows, and 21 + 17 + 442 = 480
+refs, with every measure in both tables carrying `conservation: true`. The 1 011 rows are the
+`root: refs` subset of the 1 015 paths above: the four `HISTORY_SECRET_RISK` claims carry
+`root: history` and are not dated, because a path that is still in `HEAD` is not a path outside it.
+
+`history-only` is not a fourth bucket and not a rounding: it names the rows whose path with that
+content no ref tip holds at all. The branches moved past them. They are still reachable through
+those branches' history, so nothing is lost — but no branch carries them any more, and folding
+them into `stale` would claim a branch holds work it does not.
+
+The 8 live rows are attrs and only attrs, and they are the honest kind of live: `main` there is
+dated two days after the commit this measurement was taken at. In the other four repositories no
+outside-`HEAD` row is held by a tip inside the 30-day window before the reference.
+
+## Verdict on the stratification hypothesis
+
+The hypothesis behind this block had two halves, and they land on different sides.
+
+**The number holds.** Fewer than 25 % of the rows belong to refs touched in the last 30 days:
+8 of 1 011, that is 0.79 % — thirty-one times under the threshold. At ref level it is 21 of 480.
+Whatever the complement means in these five repositories, it is not a recent backlog.
+
+**The law does not hold, as stated.** `live + recent + stale == total` is false for the rows:
+640 of 1 011 fit no bucket, because the volume outside `HEAD` in a mature repository is mostly
+content that no branch tip holds. That is the falsifier this hypothesis carried, and it fired. The
+partition is therefore published with `history-only` named apart, and the three-bucket identity is
+kept where it is exact: over the refs.
+
+The reading this buys is sharper than the one it replaces. A maintainer's first answer — "those
+are old branches from years ago" — is wrong in the interesting direction: two thirds of these rows
+are held by no branch tip at all, and every one of the 363 rows a tip still holds is held by
+a tip past the 90-day line.
+
 ## Verdicts
 
 **P1 — confirmed.** Five of five measured repositories close at `uncovered_blobs == 0`. The

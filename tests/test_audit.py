@@ -48,11 +48,11 @@ def git(repo: pathlib.Path, *args: str, env: dict | None = None, input: str | No
 
 
 def commit(repo: pathlib.Path, index: pathlib.Path, files: dict[str, str], message: str,
-           parent: str | None = None) -> str:
+           parent: str | None = None, date: str = DATE) -> str:
     env = _clean_env(
         GIT_INDEX_FILE=str(index),
-        GIT_AUTHOR_DATE=DATE,
-        GIT_COMMITTER_DATE=DATE,
+        GIT_AUTHOR_DATE=date,
+        GIT_COMMITTER_DATE=date,
     )
     git(repo, "read-tree", "--empty", env=env)
     for path, content in sorted(files.items()):
@@ -66,7 +66,7 @@ def commit(repo: pathlib.Path, index: pathlib.Path, files: dict[str, str], messa
 
 
 def make_repo(box: pathlib.Path, hidden: dict[str, str] | None = None,
-              hidden_ref: str = "refs/custom/hidden") -> pathlib.Path:
+              hidden_ref: str = "refs/custom/hidden", hidden_date: str = DATE) -> pathlib.Path:
     repo = box / ("repo-%d" % len(list(box.iterdir())))
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
@@ -77,7 +77,7 @@ def make_repo(box: pathlib.Path, hidden: dict[str, str] | None = None,
     git(repo, "update-ref", "refs/heads/main", head)
     git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
     if hidden:
-        side = commit(repo, index, hidden, "hidden", parent=head)
+        side = commit(repo, index, hidden, "hidden", parent=head, date=hidden_date)
         git(repo, "update-ref", hidden_ref, side)
     return repo
 
@@ -203,6 +203,101 @@ class ContractTest(unittest.TestCase):
         report = json.loads(audit(str(repo), "--json", "--exclude-ref", "refs/agents/*").stdout)
         self.assertEqual(report["hidden_refs"]["refs/agents/"], 1)
         self.assertEqual(report["hidden_refs"]["refs/original/"], 0)
+
+    def test_age_strata_partition_every_ref_row(self) -> None:
+        repo = make_repo(
+            self.box,
+            {"orphan/lost.py": "x = 1\n"},
+            hidden_date="2025-09-20T00:00:00 +0000",
+        )
+        report = json.loads(audit(str(repo), "--json").stdout)
+        strata = report["age_strata"]
+        self.assertEqual(strata["state"], "MEASURED")
+        self.assertEqual(strata["as_of_source"], "HEAD committer date")
+        self.assertEqual((strata["live"], strata["recent"], strata["stale"]), (0, 0, 1))
+        self.assertEqual(strata["rows"], 1)
+        self.assertTrue(strata["conservation"])
+        self.assertEqual(strata["history_only"], 0)
+
+    def test_a_moved_path_is_dated_by_the_branch_that_holds_it_not_by_head(self) -> None:
+        # The file at `copy.py` carries the very content HEAD holds at `app.py`: dating the
+        # row by its blob would call it live, and the row would disappear from the backlog.
+        repo = make_repo(
+            self.box,
+            {"copy.py": "print('hello')\n"},
+            hidden_date="2025-09-20T00:00:00 +0000",
+        )
+        report = json.loads(audit(str(repo), "--json").stdout)
+        self.assertEqual(report["findings"][0]["class"], "MOVED")
+        strata = report["age_strata"]
+        self.assertEqual((strata["live"], strata["stale"]), (0, 1))
+
+    def test_age_strata_follow_the_reference_they_are_given(self) -> None:
+        repo = make_repo(
+            self.box,
+            {"orphan/lost.py": "x = 1\n"},
+            hidden_date="2025-09-20T00:00:00 +0000",
+        )
+        moved = json.loads(audit(str(repo), "--json", "--as-of", "2025-10-01").stdout)
+        self.assertEqual((moved["age_strata"]["live"], moved["age_strata"]["stale"]), (1, 0))
+        self.assertEqual(moved["age_strata"]["rows"], 1)
+        # A reference earlier than the tip leaves the tip future-dated, and the run says so:
+        # skew is a fact about the reference, never a fourth bucket and never a silent
+        # negative age.
+        ahead = json.loads(audit(str(repo), "--json", "--as-of", "2025-09-01").stdout)
+        self.assertEqual(ahead["age_strata"]["live"], 1)
+        self.assertEqual(ahead["age_strata"]["future_dated_rows"], 1)
+
+    def test_as_of_reads_seconds_dates_and_iso_identically(self) -> None:
+        repo = make_repo(self.box, {"notes/todo.py": "x = 1\n"})
+        for value in ("1767225600", "2026-01-01", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00+00:00"):
+            report = json.loads(audit(str(repo), "--json", "--as-of", value).stdout)
+            self.assertEqual(report["age_strata"]["as_of"], 1767225600, value)
+            self.assertEqual(report["age_strata"]["as_of_source"], "--as-of", value)
+
+    def test_as_of_rejects_what_is_not_a_date(self) -> None:
+        repo = make_repo(self.box)
+        done = audit(str(repo), "--as-of", "ayer")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--as-of", done.stderr)
+
+    def test_age_strata_declare_themselves_unmeasured_without_a_tip_tree(self) -> None:
+        # Two tips, one listing slot: `--ref-tips 1` skips the per-tip listing, so no tip tree
+        # can date a row, and the strata say NO_MEDIDO instead of shaving the rows to zero.
+        repo = make_repo(self.box, {"orphan/lost.py": "x = 1\n"})
+        report = json.loads(audit(str(repo), "--json", "--ref-tips", "1").stdout)
+        self.assertEqual(report["age_strata"]["state"], "NO_MEDIDO")
+        self.assertEqual(report["age_strata"]["rows"], 1)
+
+    def test_ref_census_partitions_the_repository_refs_and_no_worktree(self) -> None:
+        # The census is a partition of the repository's refs, not of the rows: a worktree HEAD
+        # dates rows but is not a ref, and folding it in would make the count impossible to add
+        # up against the scope line it is published next to.
+        repo = make_repo(self.box, {"orphan/lost.py": "x = 1\n"})
+        report = json.loads(audit(str(repo), "--json").stdout)
+        census = report["age_strata"]["refs"]
+        self.assertTrue(census["conservation"])
+        self.assertEqual(census["total"], report["repo"]["refs"])
+        self.assertEqual(census["live"] + census["recent"] + census["stale"] + census["undated"],
+                         census["total"])
+        # Both fixture refs are dated like HEAD, so both land in the same bucket.
+        self.assertEqual((census["total"], census["live"]), (2, 2))
+
+    def test_ref_census_leaves_out_the_refs_the_audit_was_told_to_exclude(self) -> None:
+        repo = make_repo(
+            self.box,
+            {"notes/todo.py": "x = 1\n"},
+            hidden_ref="refs/agents/turn/1",
+            hidden_date="2025-09-20T00:00:00 +0000",
+        )
+        kept = json.loads(audit(str(repo), "--json").stdout)
+        dropped = json.loads(
+            audit(str(repo), "--json", "--exclude-ref", "refs/agents/*").stdout)
+        self.assertEqual(kept["age_strata"]["refs"]["total"], 2)
+        self.assertEqual(
+            dropped["age_strata"]["refs"]["total"] + dropped["scope"]["refs excluded"],
+            dropped["repo"]["refs"],
+        )
 
     def test_invalid_repository_exits_two(self) -> None:
         plain = self.box / "plain"

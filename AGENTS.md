@@ -44,7 +44,7 @@ network client, no plugin system.
 ## Verification, before any commit
 
 ```bash
-python -m git_complement_audit --self-test          # 72 in-process checks, RC 0
+python -m git_complement_audit --self-test          # 89 in-process checks, RC 0
 python -m unittest discover -s tests                # CLI contract, RC 0
 ```
 
@@ -80,6 +80,24 @@ confirm the walk. `uncovered > 0` means objects no ref reaches: the render state
 and names `--unreachable`, which returns them as rows and closes the identity. A gap is never a
 fourth exit code — the verdict comes from the classes — but a run that omits the identity is
 not allowed to print a verdict at all: no reader, no claim.
+
+## Dating the rows
+
+`age_strata` is a partition of the findings whose `root` is `refs`:
+`live + recent + stale + history_only == rows`, at 30 and 90 days. It is dated against one
+declared reference — the committer date of `HEAD`, or `--as-of` — never the wall clock, so two
+runs over one tree print the same strata on any machine on any day. A row's age is that of the
+newest tip whose *tree* holds its path with its content: dating it by its blob would call every
+`MOVED` row live, because that content also sits in `HEAD`. `history_only` counts the rows no
+tip tree holds any more, and is named rather than folded into `stale`. The strata never touch
+the verdict, and a run that skipped the per-tip listing reads `NO_MEDIDO` with the reason: an
+empty bucket is a measurement, a skipped one is not.
+
+`REFS` is the other partition, of the ref census rather than of the rows: every ref the run kept,
+in the same windows, where `live + recent + stale + undated == total` is exact because each ref
+carries one tip date. Worktree HEADs date rows but are not refs, so the census adds up against the
+`refs=` count on the `SCOPE` line minus the refs `--exclude-ref` named — a reader must be able to
+add it up, or it is not a census.
 
 ## Style
 

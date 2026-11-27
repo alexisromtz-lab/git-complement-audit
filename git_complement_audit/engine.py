@@ -109,6 +109,17 @@ _TOKEN_BODY = frozenset(
 SNIFF_BYTES = 65536
 MAX_TIP_LISTINGS = 200
 
+# Age of the newest ref tip that reaches a path outside HEAD. Three buckets answer the
+# question a maintainer asks in a pull request: is this work still moving, or is it archive?
+STRATUM_LIVE_DAYS = 30
+STRATUM_RECENT_DAYS = 90
+STRATA = ("live", "recent", "stale")
+
+REF_FORMAT = (
+    "%(refname)%00%(objecttype)%00%(objectname)%00%(*objectname)"
+    "%00%(committerdate:unix)%00%(*committerdate:unix)"
+)
+
 # Exemptions are keyed by object id, never by name or glob: granting one costs a content
 # address, so it cannot be handed to a directory, and it cannot outlive the bytes it names.
 IGNORE_NAME = ".git-complement-audit-ignore"
@@ -266,14 +277,19 @@ def _all_blob_ids(repo) -> set[str]:
     return {row[0] for row in rows if len(row) == 3 and row[1] == "blob"}
 
 
-def _ref_rows(repo) -> list[tuple[str, str, str]]:
-    """Every ref as (name, object type, object id): one census, reused by every counter."""
-    out = git_maybe(repo, "for-each-ref", "--format=%(refname)%00%(objecttype)%00%(objectname)") or ""
+def _ref_rows(repo) -> list[tuple[str, str, str, str, str, str]]:
+    """Every ref as (name, type, id, peeled id, date, peeled date): one census for one walk.
+
+    The peeled pair is what an annotated tag adds: `objectname` is the tag and carries no
+    committer date, `*objectname` is the commit it points at and carries the date the age
+    strata need. Reading both here keeps the census a single `for-each-ref`.
+    """
+    out = git_maybe(repo, "for-each-ref", "--format=" + REF_FORMAT) or ""
     rows = []
     for line in out.splitlines():
         parts = line.split("\0")
-        if len(parts) == 3 and parts[0]:
-            rows.append((parts[0], parts[1], parts[2]))
+        if len(parts) == 6 and parts[0]:
+            rows.append(tuple(parts))
     return rows
 
 
@@ -285,7 +301,7 @@ def _classify_refs(rows, exclude=()) -> tuple[list[str], list[str], int]:
     declared choice, so the excluded tips are returned instead of dropped.
     """
     tips, skipped, matched = set(), set(), 0
-    for name, kind, oid in rows:
+    for name, kind, oid, _, _, _ in rows:
         if any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude):
             matched += 1
             if kind == "commit" and oid:
@@ -299,6 +315,130 @@ def ref_tips(repo, exclude=()) -> tuple[list[str], list[str]]:
     tips, skipped, _ = _classify_refs(_ref_rows(repo), exclude)
     return tips, skipped
 
+
+def commit_date(repo, oid) -> int | None:
+    """Committer date of one commit, in seconds; None when the object is not a commit."""
+    out = (git_maybe(repo, "log", "-1", "--format=%ct", oid, "--") or "").strip()
+    return int(out) if out.isdigit() else None
+
+
+def _dated_roots(rows, exclude=(), extras=()) -> tuple[dict[str, int], list[str], list[tuple[str, int | None]]]:
+    """Commit -> newest tip date, for every ref the audit keeps; annotated tags are peeled.
+
+    A ref whose object carries no committer date (a tag of a tree, an unborn branch) is
+    returned separately instead of being dated by guess: a stratum that cannot say when
+    the work moved is not evidence that it moved.
+
+    The per-ref census comes back with the roots because the two populations differ: many
+    refs can name one commit, and a count of distinct tip dates is not a count of refs. Worktree
+    HEADs date rows but are not refs, so they stay out of the census: the census must equal the
+    repository's own ref count, or a reader cannot add it up.
+    """
+    roots: dict[str, int] = {}
+    undated: list[str] = []
+    census: list[tuple[str, int | None]] = []
+    for name, kind, oid, peeled, date, peeled_date in rows:
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude):
+            continue
+        if kind == "commit" and date:
+            roots[oid] = max(roots.get(oid, 0), int(date))
+            census.append((name, int(date)))
+        elif kind == "tag" and peeled and peeled_date:
+            roots[peeled] = max(roots.get(peeled, 0), int(peeled_date))
+            census.append((name, int(peeled_date)))
+        elif kind in ("commit", "tag"):
+            undated.append(name)
+            census.append((name, None))
+    for oid, date in extras:
+        if date:
+            roots[oid] = max(roots.get(oid, 0), int(date))
+        else:
+            undated.append("@worktree/" + oid[:12])
+    return roots, undated, census
+
+
+def _stratum(age: int) -> str:
+    if age <= STRATUM_LIVE_DAYS:
+        return "live"
+    if age <= STRATUM_RECENT_DAYS:
+        return "recent"
+    return "stale"
+
+
+def age_strata(findings, tip_dates, as_of, source, undated=(), listed=True, census=()) -> dict:
+    """Split the rows outside HEAD by the age of the newest tip that still holds them.
+
+    The buckets are a partition of `root: "refs"`, never a second count of the whole report:
+    rows reached by an excluded ref, by history or by no ref at all carry their own `root`
+    and are not dated here. A row that no tip tree holds survives only in commits the
+    branches have since moved past — `history_only`, the archive the branches left behind —
+    and is published apart instead of being folded into `stale`, because "no branch holds
+    it" and "an old branch holds it" are two different sentences to a maintainer.
+
+    The `refs` block answers the other half of the same question and is a partition of the
+    census, not of the rows: how many refs moved in each window, whatever their paths are.
+    """
+    rows = [finding for finding in findings if finding["root"] == "refs"]
+    if not listed:
+        return {
+            "state": "NO_MEDIDO",
+            "reason": "per-tip listing skipped: no tip tree to date the rows against",
+            "rows": len(rows),
+        }
+    if as_of is None:
+        return {
+            "state": "NO_MEDIDO",
+            "reason": "no HEAD commit to date the strata against, and no --as-of given",
+            "rows": len(rows),
+        }
+    buckets = {name: 0 for name in STRATA}
+    history_only = 0
+    future = 0
+    for finding in rows:
+        when = tip_dates.get((finding["path"], finding["oid"]))
+        if when is None:
+            history_only += 1
+            continue
+        age = (as_of - when) // 86400
+        if age < 0:
+            # A tip dated after the reference is counted where it is: the reference is a
+            # commit date, not a clock, and skew must not become a fourth bucket.
+            future += 1
+            age = 0
+        buckets[_stratum(age)] += 1
+    refs = {name: 0 for name in STRATA}
+    refs_undated = 0
+    refs_future = 0
+    for _, when in census:
+        if when is None:
+            refs_undated += 1
+            continue
+        age = (as_of - when) // 86400
+        if age < 0:
+            refs_future += 1
+            age = 0
+        refs[_stratum(age)] += 1
+    block = {
+        "state": "MEASURED",
+        "reference": "newest ref tip whose tree holds the row's path with the row's content",
+        "as_of": as_of,
+        "as_of_source": source,
+        "bounds_days": [STRATUM_LIVE_DAYS, STRATUM_RECENT_DAYS],
+        "rows": len(rows),
+        "history_only": history_only,
+        "future_dated_rows": future,
+        "undated_refs": list(undated)[:8],
+        "conservation": sum(buckets.values()) + history_only == len(rows),
+        "refs": {
+            "total": len(census),
+            "undated": refs_undated,
+            "future_dated": refs_future,
+            "conservation": sum(refs.values()) + refs_undated == len(census),
+        },
+    }
+    block.update(buckets)
+    block["refs"].update(refs)
+    return block
 
 
 def is_secret_path(path: str) -> bool:
@@ -377,6 +517,7 @@ def audit(
     allow_excluded_secrets: bool = False,
     scan_history: bool = False,
     ignore_file=None,
+    as_of: int | None = None,
 ) -> dict:
     """Measure the complement. Writes nothing; every number here is a reading.
 
@@ -404,7 +545,15 @@ def audit(
 
     rows = _ref_rows(root)
     tips, excluded, excluded_refs = _classify_refs(rows, tuple(exclude_refs))
-    hidden = {ns: sum(1 for name, _, _ in rows if name.startswith(ns)) for ns in HIDDEN_NAMESPACES}
+    hidden = {ns: sum(1 for row in rows if row[0].startswith(ns)) for ns in HIDDEN_NAMESPACES}
+
+    # Age strata: a row is dated by the newest ref tip whose tree holds that path with that
+    # content. It is a question of presence, not of freshness — a file untouched for years
+    # inside a branch moved yesterday is live work, and the reader of a pull request wants
+    # to see it — so the tip trees answer it and no per-row `git log` is needed.
+    dated_extras = [(sha, commit_date(root, sha)) for sha in extras] if include_worktrees else []
+    roots, undated, census = _dated_roots(rows, tuple(exclude_refs), dated_extras)
+    tip_dates: dict[tuple[str, str], int] = {}
 
     walk = ["rev-list", "--objects", "--all"]
     skipped = list(excluded) + ([] if include_worktrees else extras)
@@ -419,9 +568,13 @@ def audit(
         for tip in exact_tips:
             listing = git_maybe(root, "ls-tree", "-r", tip)
             if listing:
+                when = roots.get(tip)
                 for path, oid in _tree_blobs(listing).items():
                     complement.setdefault(path, oid)
                     seen.setdefault(oid, path)
+                    if when is not None:
+                        known = tip_dates.get((path, oid))
+                        tip_dates[(path, oid)] = when if known is None else max(known, when)
 
     findings = []
     for path in sorted(complement):
@@ -544,6 +697,14 @@ def audit(
         "unused": sorted(oid for oid in exempt if oid not in spent),
     }
 
+    # Age strata: reference is a commit date, not the clock, so two runs over one tree agree
+    # byte for byte; --as-of exists to date a historical snapshot, not to move the verdict.
+    if as_of is not None:
+        reference, reference_source = as_of, "--as-of"
+    else:
+        reference, reference_source = (commit_date(root, head) if head else None), "HEAD committer date"
+    strata = age_strata(findings, tip_dates, reference, reference_source, undated, listed_exactly, census)
+
     findings.sort(key=lambda f: (CLASSES.index(f["class"]), f["path"], f["oid"]))
 
     counts = {kind: sum(1 for f in findings if f["class"] == kind) for kind in CLASSES}
@@ -553,7 +714,7 @@ def audit(
     )
     reported_worktrees = len(worktrees) if include_worktrees else 1
     return {
-        "schema": 2,
+        "schema": 3,
         "tool": "git-complement-audit",
         "version": __version__,
         "repo": {
@@ -589,6 +750,7 @@ def audit(
         },
         "counts": counts,
         "exemptions": exemptions,
+        "age_strata": strata,
         "closure": closure,
         "findings": findings,
     }
@@ -676,6 +838,7 @@ def receipt(repo, report: dict, path) -> str:
         "universe": report["universe"],
         "counts": report["counts"],
         "exemptions": report["exemptions"],
+        "age_strata": report["age_strata"],
         "closure": report["closure"],
         "findings": findings,
     }
@@ -754,6 +917,57 @@ def render(report: dict) -> str:
         ),
         "CLASSES   %s" % " · ".join("%s=%d" % (kind, counts[kind]) for kind in CLASSES),
     ]
+    strata = report.get("age_strata") or {}
+    if strata.get("state") == "MEASURED" and strata["rows"]:
+        lines.append(
+            "STRATA    as-of=%s (%s) live<=%dd=%d · recent%d-%dd=%d · stale>%dd=%d"
+            " · history-only=%d of %d ref row(s)"
+            % (
+                strata["as_of"],
+                strata["as_of_source"],
+                strata["bounds_days"][0],
+                strata["live"],
+                strata["bounds_days"][0] + 1,
+                strata["bounds_days"][1],
+                strata["recent"],
+                strata["bounds_days"][1],
+                strata["stale"],
+                strata["history_only"],
+                strata["rows"],
+            )
+        )
+    refs = strata.get("refs") or {}
+    if strata.get("state") == "MEASURED" and refs.get("total"):
+        lines.append(
+            "REFS      live<=%dd=%d · recent%d-%dd=%d · stale>%dd=%d of %d ref(s)%s"
+            % (
+                strata["bounds_days"][0],
+                refs["live"],
+                strata["bounds_days"][0] + 1,
+                strata["bounds_days"][1],
+                refs["recent"],
+                strata["bounds_days"][1],
+                refs["stale"],
+                refs["total"],
+                " · %d undated" % refs["undated"] if refs["undated"] else "",
+            )
+        )
+    if strata.get("state") == "MEASURED" and strata["undated_refs"]:
+        lines.append(
+            "NOTE      %d ref(s) carry no committer date and were not dated: %s"
+            % (len(strata["undated_refs"]), ", ".join(strata["undated_refs"]))
+        )
+    if strata.get("state") == "MEASURED" and strata["history_only"]:
+        lines.append(
+            "NOTE      %d ref row(s) live in no tip tree: their path was last held by a commit "
+            "the branches have moved past, so no branch carries them any more"
+            % strata["history_only"]
+        )
+    if strata.get("state") == "MEASURED" and strata["future_dated_rows"]:
+        lines.append(
+            "NOTE      %d row(s) come from a tip dated after the reference and were counted as "
+            "live: the reference is a commit date, not the clock" % strata["future_dated_rows"]
+        )
     if closure["uncovered_blobs"] and not scope["unreachable objects"]:
         lines.append(
             "NOTE      %d blob(s) in the object database are reachable from no ref, so no row of "
